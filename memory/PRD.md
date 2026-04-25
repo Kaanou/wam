@@ -32,6 +32,16 @@
 - Supervisor config for the Node sidecar (`/etc/supervisor/conf.d/whatsapp_service.conf`)
 - 15/15 backend tests passing
 
+## Implemented (2026-04-25 — iteration 2)
+- **Pairing-by-code (8-digit) alternative to QR**: `POST /api/whatsapp/pairing-code` + `POST /api/whatsapp/pairing-mode`. Tabs in UI (QR / Code) — user enters phone → receives an 8-digit code to type in WhatsApp app.
+- **Daily email summary**: background loop in FastAPI; user toggles + chooses UTC hour. Computes per-monitor: # online events, total online time, last seen. `POST /api/settings/send-summary-now` for manual trigger.
+- **Monitor labels/aliases**: optional `label` field on Monitor; inline editable in UI; stored & broadcast on update via `monitor_updated` WS event.
+- **Activity log filters & CSV export**: filter by phone & event_type (online/offline/client_state); `GET /api/events/export.csv` with same filters.
+- **Internal webhook secret**: `X-Internal-Secret` header required on `/api/internal/event` (set in backend `.env` + supervisor env, sent by Node sidecar). Public POST without header → 401.
+- **Resend domain hint**: in-app info card linking to resend.com/domains for users wanting to send to non-verified addresses.
+- **Validation**: `email_enabled=true` now requires `email_recipient`; `daily_summary_hour` clamped to 0-23.
+- 28/28 backend tests passing.
+
 ## Backlog (P1)
 - Shared-secret auth on `/api/internal/event` (currently exposed via ingress)
 - Verify a custom domain in Resend so emails can go to any recipient (mode test = vérifié seulement)

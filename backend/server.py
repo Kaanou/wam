@@ -350,6 +350,7 @@ async def daily_summary_loop() -> None:
             logger.info(f"[daily-summary] sent={ok}")
         except Exception as e:
             logger.error(f"daily_summary_loop error: {e}")
+            await asyncio.sleep(60)  # avoid tight error loop
 
 
 # ---- Routes -----------------------------------------------------------------
