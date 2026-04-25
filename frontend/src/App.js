@@ -4,15 +4,22 @@ import { Toaster, toast } from "sonner";
 import {
   Activity,
   CircleDot,
+  Download,
+  Edit3,
+  Info,
+  KeyRound,
   LogOut,
   Mail,
   Plus,
+  QrCode,
   RefreshCw,
+  Send,
   Trash2,
   Wifi,
   WifiOff,
   ScanLine,
   Bell,
+  X,
 } from "lucide-react";
 import "@/App.css";
 
@@ -113,14 +120,27 @@ const StatusPill = ({ status }) => {
 export default function App() {
   const [waState, setWaState] = useState({ state: "initializing", me: null });
   const [qrDataUrl, setQrDataUrl] = useState(null);
+  const [pairingCode, setPairingCode] = useState(null);
+  const [pairingMode, setPairingMode] = useState("qr"); // "qr" | "code"
+  const [pairingPhone, setPairingPhone] = useState("");
+  const [requestingCode, setRequestingCode] = useState(false);
   const [monitors, setMonitors] = useState([]);
   const [events, setEvents] = useState([]);
-  const [settings, setSettings] = useState({ email_enabled: false, email_recipient: "" });
+  const [settings, setSettings] = useState({});
   const [phoneInput, setPhoneInput] = useState("");
+  const [labelInput, setLabelInput] = useState("");
   const [emailInput, setEmailInput] = useState("");
   const [emailEnabled, setEmailEnabled] = useState(false);
+  const [summaryEnabled, setSummaryEnabled] = useState(false);
+  const [summaryHour, setSummaryHour] = useState(9);
   const [adding, setAdding] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
+  const [sendingSummary, setSendingSummary] = useState(false);
+  const [editingLabel, setEditingLabel] = useState(null); // phone of row currently being edited
+  const [editingLabelValue, setEditingLabelValue] = useState("");
+  // Activity log filters
+  const [filterPhone, setFilterPhone] = useState("");
+  const [filterEvent, setFilterEvent] = useState(""); // ""|"online"|"offline"|"client_state"
   const wsRef = useRef(null);
   const liveFlashRef = useRef(new Set());
 
@@ -140,11 +160,15 @@ export default function App() {
       ]);
       setWaState(s.data);
       setQrDataUrl(q.data?.qr || null);
+      setPairingCode(q.data?.code || null);
+      if (q.data?.mode) setPairingMode(q.data.mode);
       setMonitors(m.data || []);
       setEvents(e.data || []);
       setSettings(st.data || {});
       setEmailInput(st.data?.email_recipient || "");
       setEmailEnabled(!!st.data?.email_enabled);
+      setSummaryEnabled(!!st.data?.daily_summary_enabled);
+      setSummaryHour(typeof st.data?.daily_summary_hour === "number" ? st.data.daily_summary_hour : 9);
     } catch (err) {
       console.error("fetchAll error:", err);
     }
@@ -163,8 +187,11 @@ export default function App() {
         if (s.data.state !== "ready") {
           const q = await axios.get(`${API}/whatsapp/qr`);
           setQrDataUrl(q.data?.qr || null);
+          setPairingCode(q.data?.code || null);
+          if (q.data?.mode) setPairingMode(q.data.mode);
         } else {
           setQrDataUrl(null);
+          setPairingCode(null);
         }
       } catch {
         /* ignore */
@@ -218,14 +245,18 @@ export default function App() {
   const handleWsEvent = (data) => {
     if (data.type === "presence") {
       const { phone, status, timestamp, id } = data;
-      // Update events list (prepend)
-      setEvents((prev) => [
-        { id, phone, event_type: status, timestamp, detail: null },
-        ...prev,
-      ].slice(0, 500));
-      liveFlashRef.current.add(id);
-      setTimeout(() => liveFlashRef.current.delete(id), 2000);
-      // Update monitor row
+      // Only prepend to local events list if it matches current filter view
+      const matchesFilter =
+        (!filterPhone.trim() || phone.includes(filterPhone.replace(/[^0-9]/g, ""))) &&
+        (!filterEvent || filterEvent === status);
+      if (matchesFilter) {
+        setEvents((prev) =>
+          [{ id, phone, event_type: status, timestamp, detail: null }, ...prev].slice(0, 500),
+        );
+        liveFlashRef.current.add(id);
+        setTimeout(() => liveFlashRef.current.delete(id), 2000);
+      }
+      // Always update monitor row
       setMonitors((prev) =>
         prev.map((m) =>
           m.phone === phone ? { ...m, status, last_seen: timestamp } : m,
@@ -250,14 +281,18 @@ export default function App() {
       setWaState((s) => ({ ...s, state: data.state }));
       if (data.state === "ready") {
         setQrDataUrl(null);
+        setPairingCode(null);
         toast.success("WhatsApp connecté");
       } else if (data.state === "qr") {
         // refetch qr
-        axios.get(`${API}/whatsapp/qr`).then((r) => setQrDataUrl(r.data?.qr || null));
+        axios.get(`${API}/whatsapp/qr`).then((r) => {
+          setQrDataUrl(r.data?.qr || null);
+          setPairingCode(r.data?.code || null);
+        });
       } else if (data.state === "disconnected") {
         toast.error("WhatsApp déconnecté");
       }
-    } else if (data.type === "monitor_added" || data.type === "monitor_removed") {
+    } else if (data.type === "monitor_added" || data.type === "monitor_removed" || data.type === "monitor_updated") {
       axios.get(`${API}/monitors`).then((r) => setMonitors(r.data || []));
     }
   };
@@ -281,8 +316,12 @@ export default function App() {
     }
     setAdding(true);
     try {
-      await axios.post(`${API}/monitors`, { phone: cleaned });
+      await axios.post(`${API}/monitors`, {
+        phone: cleaned,
+        label: labelInput.trim() || null,
+      });
       setPhoneInput("");
+      setLabelInput("");
       const m = await axios.get(`${API}/monitors`);
       setMonitors(m.data || []);
       toast.success(`Monitoring activé pour +${cleaned}`);
@@ -291,6 +330,100 @@ export default function App() {
       toast.error(`Impossible d'ajouter : ${detail}`);
     } finally {
       setAdding(false);
+    }
+  };
+
+  const requestPairingCode = async () => {
+    const cleaned = pairingPhone.replace(/[^0-9]/g, "");
+    if (!cleaned || cleaned.length < 7) {
+      toast.error("Numéro invalide. Format international (sans +), ex : 33612345678");
+      return;
+    }
+    setRequestingCode(true);
+    try {
+      const r = await axios.post(`${API}/whatsapp/pairing-code`, { phone: cleaned });
+      if (r.data?.code) {
+        setPairingCode(r.data.code);
+        setPairingMode("code");
+        toast.success("Code de pairing généré");
+      } else if (r.data?.pending) {
+        setPairingMode("code");
+        toast("Code en attente, le QR doit d'abord être prêt...");
+      }
+    } catch (err) {
+      const detail = err?.response?.data?.detail || "Erreur";
+      toast.error(`Échec : ${detail}`);
+    } finally {
+      setRequestingCode(false);
+    }
+  };
+
+  const switchPairingMode = async (mode) => {
+    try {
+      await axios.post(`${API}/whatsapp/pairing-mode?mode=${mode}`);
+      setPairingMode(mode);
+      if (mode === "qr") {
+        setPairingCode(null);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const updateLabel = async (phone) => {
+    try {
+      await axios.patch(`${API}/monitors/${phone}`, { label: editingLabelValue });
+      setMonitors((prev) =>
+        prev.map((m) => (m.phone === phone ? { ...m, label: editingLabelValue || null } : m)),
+      );
+      setEditingLabel(null);
+      setEditingLabelValue("");
+      toast.success("Label mis à jour");
+    } catch {
+      toast.error("Erreur lors de la mise à jour");
+    }
+  };
+
+  const startEditLabel = (m) => {
+    setEditingLabel(m.phone);
+    setEditingLabelValue(m.label || "");
+  };
+
+  const exportCsv = () => {
+    const params = new URLSearchParams();
+    if (filterPhone.trim()) params.set("phone", filterPhone.replace(/[^0-9]/g, ""));
+    if (filterEvent) params.set("event_type", filterEvent);
+    const url = `${API}/events/export.csv${params.toString() ? "?" + params.toString() : ""}`;
+    window.open(url, "_blank");
+  };
+
+  const reloadEvents = useCallback(async () => {
+    const params = new URLSearchParams({ limit: "200" });
+    if (filterPhone.trim()) params.set("phone", filterPhone.replace(/[^0-9]/g, ""));
+    if (filterEvent) params.set("event_type", filterEvent);
+    try {
+      const r = await axios.get(`${API}/events?${params.toString()}`);
+      setEvents(r.data || []);
+    } catch {
+      /* ignore */
+    }
+  }, [filterPhone, filterEvent]);
+
+  // Refetch events when filters change
+  useEffect(() => {
+    reloadEvents();
+  }, [reloadEvents]);
+
+  const sendSummaryNow = async () => {
+    setSendingSummary(true);
+    try {
+      await axios.post(`${API}/settings/send-summary-now`);
+      toast.success("Résumé envoyé");
+    } catch (err) {
+      const detail = err?.response?.data?.detail || "Erreur";
+      toast.error(`Impossible d'envoyer : ${detail}`);
+    } finally {
+      setSendingSummary(false);
     }
   };
 
@@ -305,18 +438,24 @@ export default function App() {
   };
 
   const saveSettings = async () => {
+    if (emailEnabled && !emailInput.trim()) {
+      toast.error("Une adresse email est requise pour activer les notifications email.");
+      return;
+    }
     setSavingSettings(true);
     try {
       const payload = {
         email_enabled: emailEnabled,
-        email_recipient: emailInput || null,
+        email_recipient: emailInput.trim() || null,
+        daily_summary_enabled: summaryEnabled,
+        daily_summary_hour: Number(summaryHour) || 9,
       };
       const r = await axios.put(`${API}/settings`, payload);
       setSettings(r.data);
       toast.success("Paramètres enregistrés");
     } catch (err) {
       const detail = err?.response?.data?.detail || "Erreur";
-      toast.error(`Impossible d'enregistrer : ${JSON.stringify(detail)}`);
+      toast.error(`Impossible d'enregistrer : ${typeof detail === "string" ? detail : JSON.stringify(detail)}`);
     } finally {
       setSavingSettings(false);
     }
@@ -425,7 +564,7 @@ export default function App() {
             testid="panel-pairing"
             right={
               <span className="text-[10px] font-mono text-zinc-600">
-                {waState.state === "ready" ? "session active" : "scan required"}
+                {waState.state === "ready" ? "session active" : "scan or code"}
               </span>
             }
           >
@@ -446,28 +585,108 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="flex flex-col items-center gap-3" data-testid="qr-container">
-                {qrDataUrl ? (
-                  <div className="border border-zinc-800 p-3 bg-white rounded-sm">
-                    <img
-                      src={qrDataUrl}
-                      alt="WhatsApp pairing QR code"
-                      className="block w-[240px] h-[240px]"
-                    />
+              <div className="flex flex-col gap-3" data-testid="qr-container">
+                {/* Mode tabs */}
+                <div className="flex border border-zinc-800 rounded-sm overflow-hidden text-[11px] font-mono uppercase tracking-[0.18em]">
+                  <button
+                    data-testid="pairing-mode-qr"
+                    onClick={() => switchPairingMode("qr")}
+                    className={`flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 transition-colors ${
+                      pairingMode === "qr"
+                        ? "bg-zinc-100 text-zinc-950"
+                        : "text-zinc-400 hover:bg-zinc-900"
+                    }`}
+                  >
+                    <QrCode size={12} strokeWidth={1.75} /> QR
+                  </button>
+                  <button
+                    data-testid="pairing-mode-code"
+                    onClick={() => switchPairingMode("code")}
+                    className={`flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 transition-colors border-l border-zinc-800 ${
+                      pairingMode === "code"
+                        ? "bg-zinc-100 text-zinc-950"
+                        : "text-zinc-400 hover:bg-zinc-900"
+                    }`}
+                  >
+                    <KeyRound size={12} strokeWidth={1.75} /> Code
+                  </button>
+                </div>
+
+                {pairingMode === "qr" ? (
+                  <div className="flex flex-col items-center gap-3">
+                    {qrDataUrl ? (
+                      <div className="border border-zinc-800 p-3 bg-white rounded-sm">
+                        <img
+                          src={qrDataUrl}
+                          alt="WhatsApp pairing QR code"
+                          className="block w-[240px] h-[240px]"
+                        />
+                      </div>
+                    ) : (
+                      <div className="w-[240px] h-[240px] border border-dashed border-zinc-800 flex flex-col items-center justify-center text-zinc-600 gap-2">
+                        <ScanLine size={32} strokeWidth={1.5} />
+                        <span className="text-[10px] font-mono uppercase tracking-[0.18em]">
+                          {waState.state === "unreachable"
+                            ? "Service unreachable"
+                            : "Generating QR..."}
+                        </span>
+                      </div>
+                    )}
+                    <p className="text-xs text-zinc-400 text-center font-mono leading-relaxed max-w-xs">
+                      WhatsApp → Paramètres → Appareils liés → Scanner ce code.
+                    </p>
                   </div>
                 ) : (
-                  <div className="w-[240px] h-[240px] border border-dashed border-zinc-800 flex flex-col items-center justify-center text-zinc-600 gap-2">
-                    <ScanLine size={32} strokeWidth={1.5} />
-                    <span className="text-[10px] font-mono uppercase tracking-[0.18em]">
-                      {waState.state === "unreachable"
-                        ? "Service unreachable"
-                        : "Generating QR..."}
-                    </span>
+                  <div className="flex flex-col gap-3">
+                    <p className="text-[11px] text-zinc-400 leading-relaxed">
+                      Entrez votre numéro (format international, sans <span className="font-mono">+</span>).
+                      WhatsApp générera un code à 8 chiffres à entrer dans l'app
+                      <span className="text-zinc-200"> Paramètres → Appareils liés → Lier avec un numéro de téléphone</span>.
+                    </p>
+                    <div className="flex items-stretch gap-2">
+                      <div className="flex items-center px-3 border border-zinc-800 bg-zinc-950 text-zinc-400 font-mono text-sm rounded-sm">
+                        +
+                      </div>
+                      <input
+                        data-testid="pairing-phone-input"
+                        type="tel"
+                        inputMode="numeric"
+                        placeholder="33612345678"
+                        value={pairingPhone}
+                        onChange={(e) => setPairingPhone(e.target.value)}
+                        className="flex-1 bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 placeholder:text-zinc-600 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+                      />
+                    </div>
+                    <button
+                      data-testid="request-pairing-code-button"
+                      onClick={requestPairingCode}
+                      disabled={requestingCode}
+                      className="bg-white text-zinc-950 hover:bg-zinc-200 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed py-2 rounded-sm font-medium text-sm transition-colors inline-flex items-center justify-center gap-2"
+                    >
+                      <KeyRound size={14} strokeWidth={2} />
+                      {requestingCode ? "Génération..." : "Obtenir le code"}
+                    </button>
+                    <div
+                      data-testid="pairing-code-box"
+                      className="border border-zinc-800 rounded-sm p-4 bg-zinc-950 min-h-[88px] flex items-center justify-center"
+                    >
+                      {pairingCode ? (
+                        <div className="text-center">
+                          <div className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-2">
+                            Votre code de pairing
+                          </div>
+                          <div className="font-mono text-3xl tracking-[0.4em] text-emerald-400 select-all">
+                            {pairingCode}
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] font-mono text-zinc-600 uppercase tracking-[0.18em]">
+                          {requestingCode ? "génération..." : "code non encore généré"}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 )}
-                <p className="text-xs text-zinc-400 text-center font-mono leading-relaxed max-w-xs">
-                  Ouvrez WhatsApp → Paramètres → Appareils liés → Scanner ce code.
-                </p>
               </div>
             )}
           </Panel>
@@ -499,6 +718,21 @@ export default function App() {
                   <span className="font-mono text-zinc-400">33612345678</span>
                 </p>
               </div>
+              <div>
+                <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-2">
+                  Alias · optionnel
+                </label>
+                <input
+                  data-testid="label-input"
+                  type="text"
+                  placeholder="Ex: Marie, Boulot, Famille…"
+                  value={labelInput}
+                  onChange={(e) => setLabelInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && addMonitor()}
+                  maxLength={40}
+                  className="w-full bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 placeholder:text-zinc-600 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white transition-colors rounded-sm"
+                />
+              </div>
               <button
                 data-testid="add-monitor-button"
                 onClick={addMonitor}
@@ -510,7 +744,7 @@ export default function App() {
               </button>
               {waState.state !== "ready" && (
                 <p className="text-[11px] font-mono text-amber-400/80">
-                  ▲ Scannez d'abord le QR pour activer le client.
+                  ▲ Appairez d'abord WhatsApp (QR ou code) pour activer le client.
                 </p>
               )}
             </div>
@@ -566,16 +800,82 @@ export default function App() {
                   disabled={!emailEnabled}
                   className="w-full bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 placeholder:text-zinc-600 font-mono disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
                 />
-                <button
-                  data-testid="save-settings-button"
-                  onClick={saveSettings}
-                  disabled={savingSettings}
-                  className="w-full bg-transparent border border-zinc-700 text-zinc-300 hover:bg-zinc-800 hover:text-white py-2 rounded-sm font-mono text-[11px] uppercase tracking-[0.18em] transition-colors"
-                >
-                  {savingSettings ? "Enregistrement..." : "Enregistrer"}
-                </button>
+              </div>
+
+              <div className="border border-zinc-800 rounded-sm p-3 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Send size={14} className="text-zinc-400" strokeWidth={1.75} />
+                    <span className="text-sm text-zinc-200">Résumé quotidien</span>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      data-testid="summary-enabled-toggle"
+                      type="checkbox"
+                      checked={summaryEnabled}
+                      onChange={(e) => setSummaryEnabled(e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-zinc-800 rounded-full peer peer-checked:bg-emerald-500 transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:h-4 after:w-4 after:rounded-full after:transition-transform peer-checked:after:translate-x-4"></div>
+                  </label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500">
+                    Heure UTC
+                  </label>
+                  <select
+                    data-testid="summary-hour-select"
+                    value={summaryHour}
+                    onChange={(e) => setSummaryHour(Number(e.target.value))}
+                    disabled={!summaryEnabled}
+                    className="flex-1 bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 font-mono disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+                  >
+                    {Array.from({ length: 24 }).map((_, h) => (
+                      <option key={h} value={h}>
+                        {String(h).padStart(2, "0")}:00
+                      </option>
+                    ))}
+                  </select>
+                </div>
                 <p className="text-[10px] font-mono text-zinc-600 leading-relaxed">
-                  ⓘ Resend en mode test n'envoie qu'à l'adresse vérifiée du compte.
+                  ⓘ Email envoyé chaque jour à l'heure choisie (UTC) avec : nb d'évènements,
+                  temps online par numéro, dernière activité.
+                </p>
+                <button
+                  data-testid="send-summary-now-button"
+                  onClick={sendSummaryNow}
+                  disabled={sendingSummary || !summaryEnabled || !emailInput.trim()}
+                  className="w-full bg-transparent border border-zinc-700 text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed py-2 rounded-sm font-mono text-[11px] uppercase tracking-[0.18em] transition-colors inline-flex items-center justify-center gap-2"
+                >
+                  <Send size={12} strokeWidth={1.75} />
+                  {sendingSummary ? "Envoi..." : "Envoyer un résumé maintenant"}
+                </button>
+              </div>
+
+              <button
+                data-testid="save-settings-button"
+                onClick={saveSettings}
+                disabled={savingSettings}
+                className="w-full bg-white text-zinc-950 hover:bg-zinc-200 disabled:bg-zinc-800 disabled:text-zinc-500 py-2 rounded-sm font-medium text-sm transition-colors"
+              >
+                {savingSettings ? "Enregistrement..." : "Enregistrer les paramètres"}
+              </button>
+
+              <div className="flex items-start gap-2 px-3 py-2 border border-zinc-800 rounded-sm bg-zinc-950/40">
+                <Info size={12} className="text-amber-400/80 mt-0.5 shrink-0" strokeWidth={1.75} />
+                <p className="text-[10px] font-mono text-zinc-500 leading-relaxed">
+                  Resend en mode test n'envoie qu'à l'adresse vérifiée du compte.
+                  Pour envoyer à n'importe quelle adresse, vérifiez un domaine sur{" "}
+                  <a
+                    href="https://resend.com/domains"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-emerald-400 hover:underline"
+                    data-testid="resend-domains-link"
+                  >
+                    resend.com/domains
+                  </a>
+                  , puis remplacez <span className="text-zinc-300">SENDER_EMAIL</span> dans le .env backend.
                 </p>
               </div>
             </div>
@@ -609,13 +909,61 @@ export default function App() {
                   data-testid={`monitor-row-${m.phone}`}
                   className="flex items-center justify-between py-3 gap-4 hover:bg-zinc-900/40 -mx-4 px-4 transition-colors"
                 >
-                  <div className="flex items-center gap-4 min-w-0">
+                  <div className="flex items-center gap-4 min-w-0 flex-1">
                     <StatusPill status={m.status || "unknown"} />
-                    <div className="min-w-0">
-                      <div className="font-mono text-sm text-zinc-100 truncate">
-                        +{m.phone}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <div className="font-mono text-sm text-zinc-100 truncate">
+                          +{m.phone}
+                        </div>
+                        {editingLabel === m.phone ? (
+                          <div className="flex items-center gap-1 flex-1 max-w-xs">
+                            <input
+                              data-testid={`label-edit-input-${m.phone}`}
+                              value={editingLabelValue}
+                              onChange={(e) => setEditingLabelValue(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") updateLabel(m.phone);
+                                if (e.key === "Escape") setEditingLabel(null);
+                              }}
+                              autoFocus
+                              maxLength={40}
+                              className="flex-1 bg-zinc-950 border border-zinc-700 px-2 py-0.5 text-xs text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+                              placeholder="alias..."
+                            />
+                            <button
+                              data-testid={`label-save-${m.phone}`}
+                              onClick={() => updateLabel(m.phone)}
+                              className="text-[10px] font-mono uppercase tracking-[0.18em] text-emerald-400 hover:text-emerald-300 px-1"
+                            >
+                              ok
+                            </button>
+                            <button
+                              onClick={() => setEditingLabel(null)}
+                              className="text-zinc-500 hover:text-zinc-300"
+                            >
+                              <X size={12} strokeWidth={1.75} />
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            data-testid={`label-edit-${m.phone}`}
+                            onClick={() => startEditLabel(m)}
+                            className="inline-flex items-center gap-1 text-xs font-mono text-zinc-400 hover:text-zinc-100 group"
+                            title="Editer alias"
+                          >
+                            {m.label ? (
+                              <span className="px-2 py-0.5 border border-zinc-800 rounded-sm bg-zinc-900/60 text-zinc-200">
+                                {m.label}
+                              </span>
+                            ) : (
+                              <span className="text-zinc-600 italic">+ alias</span>
+                            )}
+                            <Edit3 size={11} strokeWidth={1.75} className="opacity-0 group-hover:opacity-100 transition-opacity" />
+                          </button>
+                        )}
                       </div>
-                      <div className="text-[11px] font-mono text-zinc-500 truncate">
+                      <div className="text-[11px] font-mono text-zinc-500 truncate mt-0.5">
                         {m.last_seen
                           ? `last change · ${fmtRelative(m.last_seen)}`
                           : "no presence event yet"}
@@ -642,20 +990,76 @@ export default function App() {
           icon={Activity}
           testid="panel-logs"
           right={
-            <button
-              data-testid="clear-logs-button"
-              onClick={clearLogs}
-              className="text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500 hover:text-red-400 transition-colors"
-            >
-              clear
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                data-testid="export-csv-button"
+                onClick={exportCsv}
+                className="inline-flex items-center gap-1 text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500 hover:text-emerald-400 transition-colors"
+              >
+                <Download size={11} strokeWidth={1.75} /> csv
+              </button>
+              <span className="text-zinc-800">·</span>
+              <button
+                data-testid="clear-logs-button"
+                onClick={clearLogs}
+                className="text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500 hover:text-red-400 transition-colors"
+              >
+                clear
+              </button>
+            </div>
           }
         >
+          {/* Filter toolbar */}
+          <div className="flex flex-wrap items-center gap-2 mb-4 pb-4 border-b border-zinc-900">
+            <div className="flex items-stretch">
+              <div className="flex items-center px-2 border border-zinc-800 border-r-0 bg-zinc-950 text-zinc-500 font-mono text-xs rounded-l-sm">
+                +
+              </div>
+              <input
+                data-testid="filter-phone-input"
+                type="tel"
+                inputMode="numeric"
+                placeholder="filter by phone"
+                value={filterPhone}
+                onChange={(e) => setFilterPhone(e.target.value)}
+                className="bg-zinc-950 border border-zinc-800 px-3 py-1.5 text-xs text-zinc-50 placeholder:text-zinc-600 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-r-sm w-44"
+              />
+            </div>
+            <select
+              data-testid="filter-event-select"
+              value={filterEvent}
+              onChange={(e) => setFilterEvent(e.target.value)}
+              className="bg-zinc-950 border border-zinc-800 px-2 py-1.5 text-xs text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+            >
+              <option value="">all events</option>
+              <option value="online">online</option>
+              <option value="offline">offline</option>
+              <option value="client_state">client_state</option>
+            </select>
+            {(filterPhone || filterEvent) && (
+              <button
+                data-testid="clear-filters-button"
+                onClick={() => {
+                  setFilterPhone("");
+                  setFilterEvent("");
+                }}
+                className="text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500 hover:text-zinc-200 inline-flex items-center gap-1"
+              >
+                <X size={11} strokeWidth={1.75} /> reset
+              </button>
+            )}
+            <span className="ml-auto text-[10px] font-mono text-zinc-600">
+              {events.length} entr{events.length > 1 ? "ies" : "y"}
+            </span>
+          </div>
+
           {events.length === 0 ? (
             <div className="py-12 flex flex-col items-center gap-2 text-zinc-600">
               <p className="text-sm font-mono">Pas encore d'évènement.</p>
               <p className="text-[11px] font-mono text-zinc-700">
-                Les connexions et déconnexions s'afficheront ici en temps réel.
+                {filterPhone || filterEvent
+                  ? "Aucun résultat avec ces filtres."
+                  : "Les connexions et déconnexions s'afficheront ici en temps réel."}
               </p>
             </div>
           ) : (

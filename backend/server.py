@@ -13,14 +13,16 @@ import asyncio
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+import csv
+import io
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
 import httpx
 import resend
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
@@ -34,6 +36,7 @@ DB_NAME = os.environ["DB_NAME"]
 WHATSAPP_SERVICE_URL = os.environ.get("WHATSAPP_SERVICE_URL", "http://localhost:3001")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onboarding@resend.dev")
+INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
 
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
@@ -58,6 +61,7 @@ api_router = APIRouter(prefix="/api")
 class Monitor(BaseModel):
     model_config = ConfigDict(extra="ignore")
     phone: str
+    label: Optional[str] = None
     added_at: datetime
     status: str = "unknown"  # online | offline | unknown
     last_seen: Optional[datetime] = None
@@ -65,6 +69,11 @@ class Monitor(BaseModel):
 
 class MonitorCreate(BaseModel):
     phone: str
+    label: Optional[str] = None
+
+
+class MonitorPatch(BaseModel):
+    label: Optional[str] = None
 
 
 class EventLog(BaseModel):
@@ -80,11 +89,19 @@ class Settings(BaseModel):
     model_config = ConfigDict(extra="ignore")
     email_enabled: bool = False
     email_recipient: Optional[str] = None
+    daily_summary_enabled: bool = False
+    daily_summary_hour: int = 9  # UTC hour 0-23
 
 
 class SettingsUpdate(BaseModel):
     email_enabled: bool
     email_recipient: Optional[EmailStr] = None
+    daily_summary_enabled: bool = False
+    daily_summary_hour: int = 9
+
+
+class PairingCodeRequest(BaseModel):
+    phone: str
 
 
 class InternalEvent(BaseModel):
@@ -187,6 +204,154 @@ async def wa_request(method: str, path: str, **kwargs) -> httpx.Response:
         return await client.request(method, url, **kwargs)
 
 
+# ---- Daily summary scheduler ------------------------------------------------
+def _human_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    if h and m:
+        return f"{h}h{m:02d}"
+    if h:
+        return f"{h}h"
+    return f"{m}min"
+
+
+async def build_daily_summary(period_start: datetime, period_end: datetime) -> Optional[str]:
+    """Build the HTML body for the daily summary, or None if nothing to report."""
+    monitors_docs = await db.monitors.find({}, {"_id": 0}).to_list(500)
+    if not monitors_docs:
+        return None
+
+    rows_html = []
+    for m in monitors_docs:
+        phone = m.get("phone", "")
+        label = m.get("label") or ""
+        events = await db.events.find(
+            {
+                "phone": phone,
+                "event_type": {"$in": ["online", "offline"]},
+                "timestamp": {"$gte": iso(period_start), "$lt": iso(period_end)},
+            },
+            {"_id": 0},
+        ).sort("timestamp", 1).to_list(2000)
+
+        online_count = sum(1 for e in events if e.get("event_type") == "online")
+        # Compute online time: pair online→offline within window.
+        online_seconds = 0
+        last_online_ts: Optional[datetime] = None
+        for e in events:
+            ts = e["timestamp"]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts)
+            if e["event_type"] == "online":
+                last_online_ts = ts
+            elif e["event_type"] == "offline" and last_online_ts is not None:
+                online_seconds += int((ts - last_online_ts).total_seconds())
+                last_online_ts = None
+        # If still online at period end, add tail.
+        if last_online_ts is not None:
+            online_seconds += int((period_end - last_online_ts).total_seconds())
+
+        last_seen_ts = m.get("last_seen")
+        last_seen_str = (
+            last_seen_ts if isinstance(last_seen_ts, str) else iso(last_seen_ts) if last_seen_ts else "—"
+        )
+        display = f"+{phone}" + (f" · {label}" if label else "")
+        rows_html.append(
+            f"""
+            <tr>
+              <td style="padding:8px;border-bottom:1px solid #27272a;color:#fafafa;font-family:monospace">{display}</td>
+              <td style="padding:8px;border-bottom:1px solid #27272a;color:#22c55e;font-family:monospace">{online_count}</td>
+              <td style="padding:8px;border-bottom:1px solid #27272a;color:#fafafa;font-family:monospace">{_human_duration(online_seconds)}</td>
+              <td style="padding:8px;border-bottom:1px solid #27272a;color:#a1a1aa;font-family:monospace;font-size:11px">{last_seen_str}</td>
+            </tr>
+            """
+        )
+
+    if not rows_html:
+        return None
+
+    title_date = period_start.strftime("%Y-%m-%d")
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" style="font-family:Arial,sans-serif;background:#09090b;color:#fafafa;padding:24px">
+      <tr><td>
+        <h2 style="margin:0 0 4px 0;color:#fafafa">Daily Summary · {title_date}</h2>
+        <p style="margin:0 0 16px 0;color:#a1a1aa;font-size:13px">
+          Window: {iso(period_start)} → {iso(period_end)}
+        </p>
+        <table cellpadding="0" cellspacing="0" style="width:100%;border:1px solid #27272a;border-radius:4px;border-collapse:collapse">
+          <thead>
+            <tr style="background:#18181b">
+              <th style="padding:8px;text-align:left;color:#a1a1aa;font-size:11px;text-transform:uppercase;letter-spacing:1px">Number</th>
+              <th style="padding:8px;text-align:left;color:#a1a1aa;font-size:11px;text-transform:uppercase;letter-spacing:1px">Online events</th>
+              <th style="padding:8px;text-align:left;color:#a1a1aa;font-size:11px;text-transform:uppercase;letter-spacing:1px">Online time</th>
+              <th style="padding:8px;text-align:left;color:#a1a1aa;font-size:11px;text-transform:uppercase;letter-spacing:1px">Last seen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows_html)}
+          </tbody>
+        </table>
+      </td></tr>
+    </table>
+    """
+
+
+async def send_daily_summary_email() -> bool:
+    settings = await get_settings()
+    if not settings.daily_summary_enabled or not settings.email_recipient or not RESEND_API_KEY:
+        return False
+    end = now_utc().replace(minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=24)
+    html = await build_daily_summary(start, end)
+    if not html:
+        return False
+    try:
+        await asyncio.to_thread(
+            resend.Emails.send,
+            {
+                "from": SENDER_EMAIL,
+                "to": [settings.email_recipient],
+                "subject": f"[WA Monitor] Daily summary · {start.strftime('%Y-%m-%d')}",
+                "html": html,
+            },
+        )
+        await db.settings.update_one(
+            {"_id": "global"},
+            {"$set": {"last_summary_sent_at": iso(now_utc())}},
+            upsert=False,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"daily summary send failed: {e}")
+        return False
+
+
+async def daily_summary_loop() -> None:
+    """Background task: every minute, check if it's time to send daily summary."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            settings = await get_settings()
+            if not settings.daily_summary_enabled or not settings.email_recipient:
+                continue
+            now = now_utc()
+            if now.hour != settings.daily_summary_hour:
+                continue
+            # Skip if already sent in the last 23 hours
+            doc = await db.settings.find_one({"_id": "global"}, {"_id": 0})
+            last = doc.get("last_summary_sent_at") if doc else None
+            if last:
+                last_dt = datetime.fromisoformat(last) if isinstance(last, str) else last
+                if (now - last_dt).total_seconds() < 23 * 3600:
+                    continue
+            logger.info("[daily-summary] sending...")
+            ok = await send_daily_summary_email()
+            logger.info(f"[daily-summary] sent={ok}")
+        except Exception as e:
+            logger.error(f"daily_summary_loop error: {e}")
+
+
 # ---- Routes -----------------------------------------------------------------
 @api_router.get("/")
 async def root():
@@ -208,7 +373,34 @@ async def whatsapp_qr():
         r = await wa_request("GET", "/qr")
         return r.json()
     except Exception as e:
-        return {"state": "unreachable", "qr": None, "error": str(e)}
+        return {"state": "unreachable", "qr": None, "code": None, "error": str(e)}
+
+
+@api_router.post("/whatsapp/pairing-code")
+async def whatsapp_pairing_code(payload: PairingCodeRequest):
+    phone = "".join(ch for ch in payload.phone if ch.isdigit())
+    if not phone or len(phone) < 7:
+        raise HTTPException(status_code=400, detail="invalid phone")
+    try:
+        r = await wa_request("POST", "/pairing-code", json={"phone": phone})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"whatsapp service unreachable: {e}")
+    if r.status_code >= 400:
+        try:
+            data = r.json()
+        except Exception:
+            data = {"error": r.text}
+        raise HTTPException(status_code=r.status_code, detail=data.get("error", r.text))
+    return r.json()
+
+
+@api_router.post("/whatsapp/pairing-mode")
+async def whatsapp_pairing_mode(mode: str):
+    try:
+        r = await wa_request("POST", "/pairing-mode", json={"mode": mode})
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @api_router.post("/whatsapp/logout")
@@ -258,13 +450,39 @@ async def add_monitor(payload: MonitorCreate):
             existing["last_seen"] = datetime.fromisoformat(existing["last_seen"])
         return Monitor(**existing)
 
-    monitor = Monitor(phone=phone, added_at=now_utc(), status="unknown", last_seen=None)
+    monitor = Monitor(
+        phone=phone,
+        label=payload.label or None,
+        added_at=now_utc(),
+        status="unknown",
+        last_seen=None,
+    )
     doc = monitor.model_dump()
     doc["added_at"] = iso(doc["added_at"])
     doc["last_seen"] = None
     await db.monitors.insert_one(doc)
     await ws_manager.broadcast({"type": "monitor_added", "monitor": doc})
     return monitor
+
+
+@api_router.patch("/monitors/{phone}", response_model=Monitor)
+async def patch_monitor(phone: str, payload: MonitorPatch):
+    phone = "".join(ch for ch in phone if ch.isdigit())
+    update: dict = {}
+    if payload.label is not None:
+        update["label"] = payload.label.strip() or None
+    if not update:
+        raise HTTPException(status_code=400, detail="no fields to update")
+    res = await db.monitors.update_one({"phone": phone}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="monitor not found")
+    doc = await db.monitors.find_one({"phone": phone}, {"_id": 0})
+    if isinstance(doc.get("added_at"), str):
+        doc["added_at"] = datetime.fromisoformat(doc["added_at"])
+    if isinstance(doc.get("last_seen"), str):
+        doc["last_seen"] = datetime.fromisoformat(doc["last_seen"])
+    await ws_manager.broadcast({"type": "monitor_updated", "monitor": {**doc, "added_at": iso(doc["added_at"]) if doc.get("added_at") else None}})
+    return Monitor(**doc)
 
 
 @api_router.delete("/monitors/{phone}")
@@ -280,14 +498,55 @@ async def remove_monitor(phone: str):
 
 
 @api_router.get("/events", response_model=List[EventLog])
-async def list_events(limit: int = 200):
-    docs = await db.events.find({}, {"_id": 0}).sort("timestamp", -1).to_list(limit)
+async def list_events(
+    limit: int = 200,
+    phone: Optional[str] = None,
+    event_type: Optional[str] = None,
+):
+    query: dict = {}
+    if phone:
+        query["phone"] = "".join(ch for ch in phone if ch.isdigit())
+    if event_type:
+        query["event_type"] = event_type
+    docs = await db.events.find(query, {"_id": 0}).sort("timestamp", -1).to_list(limit)
     out: List[EventLog] = []
     for d in docs:
         if isinstance(d.get("timestamp"), str):
             d["timestamp"] = datetime.fromisoformat(d["timestamp"])
         out.append(EventLog(**d))
     return out
+
+
+@api_router.get("/events/export.csv")
+async def export_events_csv(
+    phone: Optional[str] = None,
+    event_type: Optional[str] = None,
+):
+    query: dict = {}
+    if phone:
+        query["phone"] = "".join(ch for ch in phone if ch.isdigit())
+    if event_type:
+        query["event_type"] = event_type
+    docs = await db.events.find(query, {"_id": 0}).sort("timestamp", -1).to_list(10000)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["timestamp", "phone", "event_type", "detail", "id"])
+    for d in docs:
+        writer.writerow(
+            [
+                d.get("timestamp", ""),
+                d.get("phone", ""),
+                d.get("event_type", ""),
+                d.get("detail") or "",
+                d.get("id", ""),
+            ]
+        )
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="wa-monitor-logs.csv"'},
+    )
 
 
 @api_router.delete("/events")
@@ -303,18 +562,49 @@ async def read_settings():
 
 @api_router.put("/settings", response_model=Settings)
 async def update_settings(payload: SettingsUpdate):
+    if payload.email_enabled and not payload.email_recipient:
+        raise HTTPException(
+            status_code=400,
+            detail="email_recipient is required when email_enabled is true",
+        )
+    hour = max(0, min(23, int(payload.daily_summary_hour)))
     doc = {
         "_id": "global",
         "email_enabled": payload.email_enabled,
         "email_recipient": payload.email_recipient,
+        "daily_summary_enabled": payload.daily_summary_enabled,
+        "daily_summary_hour": hour,
     }
     await db.settings.replace_one({"_id": "global"}, doc, upsert=True)
-    return Settings(email_enabled=payload.email_enabled, email_recipient=payload.email_recipient)
+    return Settings(**{k: v for k, v in doc.items() if k != "_id"})
+
+
+@api_router.post("/settings/send-summary-now")
+async def send_summary_now():
+    ok = await send_daily_summary_email()
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="summary not sent (check daily_summary_enabled, email_recipient, RESEND key, and that there is data to report)",
+        )
+    return {"ok": True}
+
+
+# ---- Internal webhook auth --------------------------------------------------
+def verify_internal_secret(x_internal_secret: Optional[str]) -> None:
+    if not INTERNAL_API_SECRET:
+        return  # disabled — no secret configured
+    if x_internal_secret != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=401, detail="invalid internal secret")
 
 
 # ---- Internal webhook from Node service -------------------------------------
 @api_router.post("/internal/event")
-async def internal_event(payload: InternalEvent):
+async def internal_event(
+    payload: InternalEvent,
+    x_internal_secret: Optional[str] = Header(default=None, alias="X-Internal-Secret"),
+):
+    verify_internal_secret(x_internal_secret)
     if payload.type == "client_state":
         ev_id = str(uuid.uuid4())
         ts = now_utc()
@@ -395,3 +685,8 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client():
     mongo_client.close()
+
+
+@app.on_event("startup")
+async def _on_startup():
+    asyncio.create_task(daily_summary_loop())

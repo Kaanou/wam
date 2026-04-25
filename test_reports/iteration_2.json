@@ -1,0 +1,38 @@
+{
+  "summary": "Backend testing complete for WhatsApp Connection Monitor iteration 2. 28/28 pytest tests passed (100%) covering all new features: pairing-mode toggle, pairing-code generation, /qr {state,qr,code,mode} shape, monitor labels (POST + PATCH success + 404), /events filters (phone, event_type), /events/export.csv (header + filters + content-type), settings daily_summary fields + persistence, email_enabled without recipient -> 400, daily_summary_hour clamp to 23, send-summary-now (disabled 400 + enabled 200 success path), internal webhook X-Internal-Secret auth (no header 401, wrong 401, valid client_state + presence). Regression suite (status, qr, monitors CRUD, events CRUD, settings, websocket hello + broadcast) all green.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/whatsapp/pairing-mode", "issue": "No validation on `mode` query param — any string is forwarded to Node sidecar. Node accepts only 'qr' or 'code' but FastAPI should validate (e.g. Literal['qr','code']) and return 400 on invalid values."},
+      {"endpoint": "POST /api/whatsapp/logout", "issue": "Still public with no auth — wipes WA session and all monitors. Same concern as iteration 1."},
+      {"endpoint": "POST /api/settings/send-summary-now", "issue": "When Resend send fails (e.g. unverified recipient), endpoint returns 400 with the same generic 'summary not sent' message as the disabled path — caller cannot distinguish 'misconfig' vs 'transient send failure'. Consider returning 502 with the resend error detail for the latter."},
+      {"endpoint": "PATCH /api/monitors/{phone}", "issue": "PATCH with empty body { } returns 400 'no fields to update' (good), but PATCH with {label: ''} silently sets label to None (treats empty string as clear). Behaviour is reasonable but undocumented — confirm intent."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_wa_monitor.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Optional: validate `mode` param on POST /api/whatsapp/pairing-mode using Literal['qr','code'].",
+    "Optional: differentiate 400 (misconfig) vs 502 (resend failure) on /api/settings/send-summary-now.",
+    "Optional (carryover from iter 1): gate /api/whatsapp/logout behind some auth."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~700 lines and growing — scheduler (daily_summary_loop), models, helpers, and routes could be split into separate modules.",
+    "daily_summary_loop catches all exceptions but sleeps 60s on success path only — on a tight error loop it does NOT sleep, potentially busy-looping. Add a sleep in the except branch as well.",
+    "send_daily_summary_email logs 'last_summary_sent_at' but uses iso(now_utc()) string while reading it back via datetime.fromisoformat — works because Python 3.11 supports 'Z' but fragile across versions.",
+    "Internal secret check in verify_internal_secret silently passes if INTERNAL_API_SECRET env var is empty — fail-closed posture would be safer in production.",
+    "PATCH /api/monitors broadcasts a monitor_updated message but the embedded `added_at` is being re-iso'd from a possibly-None value (guarded), and last_seen is not converted — minor inconsistency vs add_monitor broadcast payload."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_wa_monitor.py (extended with 13 new iteration-2 tests; 28 total)"
+  ],
+  "success_rate": {"backend": "100% (28/28)", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "n/a — INTERNAL_API_SECRET=wa-mon-3f9c1a8b6d2e4f7a8c1b9d3e5f6a2b4c read from /app/backend/.env",
+  "seed_data_creation": "Tests seed monitors directly into Mongo (TEST_PHONE_2=33687654321, 33611111111) for PATCH and send-summary-now flows since WA client is unpaired; teardown removes them. Events are seeded via /api/internal/event using INTERNAL_API_SECRET and cleared in fixture teardown.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "WA client is in 'qr' state by default. Node sidecar exposes /pairing-mode and /pairing-code. Pairing-code generation succeeded (whatsapp-web.js requestPairingCode returned a code). To exercise PATCH /monitors and send-summary-now success paths, seed monitors directly via Mongo (MONGO_URL/DB_NAME from /app/backend/.env). Resend sends to delivered@resend.dev succeeded in this run. Internal webhook now requires X-Internal-Secret header — old test scripts that POST /api/internal/event without it will 401."
+}

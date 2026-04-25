@@ -14,9 +14,15 @@ const PORT = parseInt(process.env.WA_SERVICE_PORT || "3001", 10);
 const BACKEND_WEBHOOK =
   process.env.BACKEND_WEBHOOK_URL || "http://localhost:8001/api/internal/event";
 const POLL_INTERVAL_MS = parseInt(process.env.PRESENCE_POLL_MS || "12000", 10);
+const INTERNAL_SECRET = process.env.INTERNAL_API_SECRET || "";
 
 const app = express();
 app.use(express.json());
+
+// Pairing-by-code state
+let pendingPairingPhone = null; // user-provided phone awaiting code
+let lastPairingCode = null; // last code returned by whatsapp-web.js
+let pairingMode = "qr"; // "qr" | "code"
 
 // ---- WhatsApp client state ---------------------------------------------------
 let clientState = "initializing"; // initializing | qr | authenticated | ready | disconnected | auth_failure
@@ -49,7 +55,10 @@ const client = new Client({
 
 async function postEvent(payload) {
   try {
-    await axios.post(BACKEND_WEBHOOK, payload, { timeout: 5000 });
+    const headers = INTERNAL_SECRET
+      ? { "x-internal-secret": INTERNAL_SECRET }
+      : {};
+    await axios.post(BACKEND_WEBHOOK, payload, { timeout: 5000, headers });
   } catch (err) {
     console.error("[wa] webhook post failed:", err.message);
   }
@@ -65,6 +74,19 @@ client.on("qr", async (qr) => {
   }
   console.log("[wa] QR received");
   postEvent({ type: "client_state", state: "qr" });
+
+  // If user requested code pairing, request a fresh pairing code now.
+  if (pairingMode === "code" && pendingPairingPhone) {
+    try {
+      const code = await client.requestPairingCode(pendingPairingPhone);
+      lastPairingCode = code || null;
+      console.log("[wa] pairing code:", code);
+      postEvent({ type: "client_state", state: "qr", code: code });
+    } catch (err) {
+      console.error("[wa] pairing code failed:", err.message);
+      lastPairingCode = null;
+    }
+  }
 });
 
 client.on("authenticated", () => {
@@ -180,9 +202,55 @@ app.get("/status", (req, res) => {
 
 app.get("/qr", (req, res) => {
   if (clientState === "ready") {
-    return res.json({ state: clientState, qr: null });
+    return res.json({ state: clientState, qr: null, code: null });
   }
-  res.json({ state: clientState, qr: lastQrDataUrl });
+  res.json({
+    state: clientState,
+    qr: pairingMode === "qr" ? lastQrDataUrl : null,
+    code: pairingMode === "code" ? lastPairingCode : null,
+    mode: pairingMode,
+  });
+});
+
+// Request pairing-by-code (8-digit) for a given phone number.
+// Will reset the WhatsApp client to force a fresh QR/code generation cycle.
+app.post("/pairing-code", async (req, res) => {
+  const phone = String(req.body?.phone || "").replace(/[^0-9]/g, "");
+  if (!phone || phone.length < 7) {
+    return res.status(400).json({ error: "invalid phone" });
+  }
+  if (clientState === "ready") {
+    return res.status(409).json({ error: "already paired" });
+  }
+  pendingPairingPhone = phone;
+  pairingMode = "code";
+  lastPairingCode = null;
+
+  // If client is already in QR phase, request the pairing code immediately.
+  if (clientState === "qr") {
+    try {
+      const code = await client.requestPairingCode(phone);
+      lastPairingCode = code || null;
+      return res.json({ ok: true, code });
+    } catch (err) {
+      console.error("[wa] pairing code (immediate) failed:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // Otherwise, the qr handler will pick it up when ready.
+  res.json({ ok: true, code: null, pending: true });
+});
+
+// Cancel code pairing — go back to QR mode.
+app.post("/pairing-mode", (req, res) => {
+  const mode = req.body?.mode === "code" ? "code" : "qr";
+  pairingMode = mode;
+  if (mode === "qr") {
+    pendingPairingPhone = null;
+    lastPairingCode = null;
+  }
+  res.json({ ok: true, mode: pairingMode });
 });
 
 app.get("/monitors", (req, res) => {
@@ -236,6 +304,9 @@ app.post("/logout", async (req, res) => {
   }
   monitored.clear();
   clientState = "initializing";
+  pairingMode = "qr";
+  pendingPairingPhone = null;
+  lastPairingCode = null;
   res.json({ ok: true });
   // Re-init after logout
   setTimeout(() => {
