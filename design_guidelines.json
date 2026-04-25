@@ -1,0 +1,101 @@
+{
+  "theme": "dark",
+  "archetype": "Archetype 4 (Swiss & High-Contrast) / Observability Control Room",
+  "mood": "Serious, precise, technical, observability console.",
+  "colors": {
+    "background": "zinc-950",
+    "surface": "zinc-900",
+    "surface_hover": "zinc-800",
+    "border": "zinc-800",
+    "primary_text": "zinc-50",
+    "secondary_text": "zinc-400",
+    "accent_primary": "white",
+    "status_online": "green-500",
+    "status_offline": "zinc-600",
+    "status_alert": "red-500",
+    "status_awaiting": "amber-500"
+  },
+  "typography": {
+    "fonts": {
+      "headings": "Chivo, sans-serif",
+      "body": "IBM Plex Sans, sans-serif",
+      "mono": "JetBrains Mono, monospace"
+    },
+    "scales": {
+      "h1": "text-3xl md:text-4xl font-bold tracking-tight text-zinc-50",
+      "h2": "text-xl md:text-2xl font-semibold tracking-tight text-zinc-50",
+      "h3": "text-lg md:text-xl font-medium text-zinc-50",
+      "body": "text-sm text-zinc-300",
+      "labels": "text-xs font-mono uppercase tracking-[0.2em] text-zinc-500",
+      "log_text": "text-xs font-mono text-zinc-300"
+    }
+  },
+  "layout_strategy": {
+    "grid_system": "Mode B: The 'Control Room' Grid",
+    "structure": "grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 md:gap-6",
+    "container_padding": "p-4 md:p-6 lg:p-8",
+    "alignment": "Strict left-alignment for logs and tabular data. Optical alignment for icons.",
+    "border_radius": "rounded-sm",
+    "spacing_scale": "dense (p-2, p-4, p-6)"
+  },
+  "surface_styles": {
+    "cards": "Grid Borders (Technical Look): 1px solid border-zinc-800, flat background (zinc-900 or zinc-950/50 backdrop-blur-md), zero shadow. Use rounded-sm.",
+    "inputs": "bg-zinc-950 border border-zinc-800 text-zinc-50 rounded-sm focus-visible:ring-1 focus-visible:ring-white focus-visible:border-white transition-all.",
+    "buttons": {
+      "primary": "bg-white text-zinc-950 hover:bg-zinc-200 rounded-sm font-medium transition-colors",
+      "secondary": "bg-transparent border border-zinc-700 text-zinc-300 hover:bg-zinc-800 hover:text-white rounded-sm transition-colors",
+      "danger": "bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/20 rounded-sm"
+    }
+  },
+  "motion_interactions": {
+    "pulse": "Active monitoring items must feature an animate-pulse opacity effect on a green/red dot to signify live connection.",
+    "hover": "Explicit hover states. Table rows: hover:bg-zinc-900/50. Buttons: transition-colors duration-150 ease-in-out.",
+    "loading": "Use monospace ASCII-like loaders or simple thin spinners."
+  },
+  "components": [
+    {
+      "name": "QR Pairing Widget",
+      "description": "A focused container showing a mock WhatsApp QR code. It must include an 'Awaiting Connection' amber badge and clear technical instructions."
+    },
+    {
+      "name": "Live Status Badge",
+      "description": "Small pill with a pulsating dot and monospace text ('ONLINE', 'OFFLINE'). Green for online, Zinc for offline."
+    },
+    {
+      "name": "Phone Number Form",
+      "description": "Input field with a persistent '+' prefix, paired with an 'Add Monitor' button. Clean sharp edges."
+    },
+    {
+      "name": "Activity Feed / Log Table",
+      "description": "A dense, strictly aligned list or table displaying timestamp (JetBrains Mono), phone number, and event type. Looks like a server tail log."
+    },
+    {
+      "name": "Active Monitors List",
+      "description": "A grid or list of currently tracked numbers with their latest status and a 'Remove' action."
+    }
+  ],
+  "icons": {
+    "library": "lucide-react",
+    "style": "Clean, line-based, size 16px to 20px maximum. Use stroke-width 1.5 or 2."
+  },
+  "image_urls": {
+    "login_bg": {
+      "url": "https://static.prod-images.emergentagent.com/jobs/f016fc96-81fe-434b-8cd4-77e7a218344f/images/1cf343add47498ab66ff6ab3ea6a183d0864912deb4dc0e54f17411f12a566b3.png",
+      "description": "Dark minimal abstract background with subtle glowing data nodes. Use as a low opacity background for the app shell or empty state."
+    },
+    "empty_state_radar": {
+      "url": "https://static.prod-images.emergentagent.com/jobs/f016fc96-81fe-434b-8cd4-77e7a218344f/images/f6b8585a7a9ce1a94f5b64a0a3667ec866d39802b67fc22ad826881a28a77af5.png",
+      "description": "Abstract dark mode radar graphic. Use for empty states when no number is currently being monitored."
+    }
+  },
+  "instructions_to_main_agent": [
+    "Install and import Google Fonts: 'Chivo' (headings), 'IBM Plex Sans' (body), and 'JetBrains Mono' (monospace/logs) in the main CSS or index.html.",
+    "Force dark mode across the application. Background must be `bg-zinc-950` everywhere. Do not use generic white themes.",
+    "Do NOT use standard Shadcn card styles with large drop shadows and rounded-xl. Override to use `border-zinc-800` and `rounded-sm` with flat backgrounds.",
+    "Implement the 'Control Room' grid layout. Avoid vast empty spaces. Organize the screen into logical, bordered panels (e.g., QR pairing panel, Add Number panel, Logs panel).",
+    "For the Logs table and timestamps, heavily utilize `font-mono text-xs`. Space rows tightly (`py-2`).",
+    "Ensure all interactive elements (buttons, inputs, list items) have `data-testid` attributes in kebab-case based on role (e.g., `data-testid='add-monitor-button'`).",
+    "Avoid purple or teal gradients. Use strictly white, zinc, green (online), amber (waiting), and red (offline/error).",
+    "Make the real-time activity feed feel like an observability terminal (e.g., highlighting new rows briefly, or keeping it strictly text-focused)."
+  ]
+}
