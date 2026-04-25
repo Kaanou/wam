@@ -1,0 +1,39 @@
+{
+  "summary": "Backend testing complete for WhatsApp Connection Monitor. All 15 pytest tests passed (100%) covering proxy endpoints, monitors CRUD, events, settings persistence, internal event webhook (presence + client_state), and WebSocket (hello + broadcast on internal event).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/internal/event", "issue": "No authentication/secret on the internal webhook — it is exposed publicly via /api ingress. Anyone can POST presence/client_state events and trigger broadcasts and emails. Consider adding a shared-secret header check between the Node sidecar and FastAPI."},
+      {"endpoint": "/api/whatsapp/logout", "issue": "Public endpoint with no auth that wipes the WA session and all monitors — could be abused. Consider gating or removing."},
+      {"endpoint": "/api/settings", "issue": "PUT does not validate that email_recipient is provided when email_enabled=true — a user can enable email with recipient null."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_wa_monitor.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Optional: add shared-secret auth to /api/internal/event so only the local Node sidecar can post events.",
+    "Optional: enforce email_recipient required when email_enabled=true in PUT /api/settings."
+  ],
+  "critical_code_review_comments": [
+    "/api/internal/event is exposed externally via /api ingress with no auth — should accept events only from the local node sidecar (shared secret header).",
+    "server.py uses deprecated FastAPI @app.on_event('shutdown') — should migrate to lifespan handler.",
+    "send_alert_email failures are logged but not surfaced anywhere; consider an in-app notification on email failure.",
+    "Monitor add_monitor stores added_at as ISO string but Monitor pydantic model declares datetime — mixed handling is correct now but fragile."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_wa_monitor.py (new)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "n/a — no auth on backend",
+  "seed_data_creation": "Created and cleaned up TEST_PHONE=33612345678 events; settings reset to defaults after persistence test.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend WhatsApp client is in 'qr' state (not paired). POST /api/monitors correctly returns 409 'whatsapp client not ready'. To simulate presence events without pairing, POST to /api/internal/event with type='presence'. WebSocket at wss://<host>/api/ws sends a 'hello' on connect and broadcasts 'presence'/'client_state'/'monitor_added'/'monitor_removed' messages."
+}
