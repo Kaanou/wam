@@ -68,25 +68,15 @@ client.on("qr", async (qr) => {
   clientState = "qr";
   lastQr = qr;
   try {
-    lastQrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
+    lastQrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 360 });
   } catch (e) {
     lastQrDataUrl = null;
   }
   console.log("[wa] QR received");
   postEvent({ type: "client_state", state: "qr" });
-
-  // If user requested code pairing, request a fresh pairing code now.
-  if (pairingMode === "code" && pendingPairingPhone) {
-    try {
-      const code = await client.requestPairingCode(pendingPairingPhone);
-      lastPairingCode = code || null;
-      console.log("[wa] pairing code:", code);
-      postEvent({ type: "client_state", state: "qr", code: code });
-    } catch (err) {
-      console.error("[wa] pairing code failed:", err.message);
-      lastPairingCode = null;
-    }
-  }
+  // NOTE: do NOT auto-request a pairing code here. WhatsApp rate-limits
+  // (and outright blocks) repeated code requests. The user explicitly
+  // triggers a fresh code via POST /pairing-code.
 });
 
 client.on("authenticated", () => {
@@ -208,12 +198,13 @@ app.get("/qr", (req, res) => {
     state: clientState,
     qr: pairingMode === "qr" ? lastQrDataUrl : null,
     code: pairingMode === "code" ? lastPairingCode : null,
+    code_error: pairingMode === "code" ? lastPairingCodeError : null,
     mode: pairingMode,
   });
 });
 
 // Request pairing-by-code (8-digit) for a given phone number.
-// Will reset the WhatsApp client to force a fresh QR/code generation cycle.
+// Per-call only — no auto-retry on QR refresh (WhatsApp rate-limits it).
 app.post("/pairing-code", async (req, res) => {
   const phone = String(req.body?.phone || "").replace(/[^0-9]/g, "");
   if (!phone || phone.length < 7) {
@@ -222,24 +213,37 @@ app.post("/pairing-code", async (req, res) => {
   if (clientState === "ready") {
     return res.status(409).json({ error: "already paired" });
   }
+  // Local rate-limit: prevent the user from spamming the button.
+  const now = Date.now();
+  if (now - lastPairingCodeAt < 30_000) {
+    return res.status(429).json({
+      error: "Trop de tentatives. Patientez 30 secondes avant de redemander un code.",
+    });
+  }
   pendingPairingPhone = phone;
   pairingMode = "code";
   lastPairingCode = null;
+  lastPairingCodeError = null;
 
-  // If client is already in QR phase, request the pairing code immediately.
-  if (clientState === "qr") {
-    try {
-      const code = await client.requestPairingCode(phone);
-      lastPairingCode = code || null;
-      return res.json({ ok: true, code });
-    } catch (err) {
-      console.error("[wa] pairing code (immediate) failed:", err.message);
-      return res.status(500).json({ error: err.message });
-    }
+  if (clientState !== "qr") {
+    return res.json({ ok: true, code: null, pending: true });
   }
-
-  // Otherwise, the qr handler will pick it up when ready.
-  res.json({ ok: true, code: null, pending: true });
+  // Rate-limit attempts (success or failure) to avoid hammering WhatsApp.
+  lastPairingCodeAt = Date.now();
+  try {
+    const code = await client.requestPairingCode(phone);
+    lastPairingCode = code || null;
+    console.log("[wa] pairing code:", code);
+    return res.json({ ok: true, code });
+  } catch (err) {
+    const msg =
+      String(err?.message || "").length > 1
+        ? String(err.message)
+        : "WhatsApp a refusé la demande (rate-limit probable). Essayez le QR depuis un autre appareil ou réinitialisez la session.";
+    lastPairingCodeError = msg;
+    console.error("[wa] pairing code (immediate) failed:", err.message);
+    return res.status(502).json({ error: msg });
+  }
 });
 
 // Cancel code pairing — go back to QR mode.
@@ -307,11 +311,48 @@ app.post("/logout", async (req, res) => {
   pairingMode = "qr";
   pendingPairingPhone = null;
   lastPairingCode = null;
+  lastPairingCodeError = null;
   res.json({ ok: true });
   // Re-init after logout
   setTimeout(() => {
     client.initialize().catch((e) => console.error("[wa] re-init failed:", e.message));
   }, 1000);
+});
+
+// Hard reset — destroys the LocalAuth session on disk and re-inits a fresh client.
+// Useful when WhatsApp has rate-limited us into a stuck state.
+app.post("/reset", async (req, res) => {
+  try {
+    try {
+      await client.destroy();
+    } catch (e) {
+      /* ignore */
+    }
+    monitored.clear();
+    clientState = "initializing";
+    pairingMode = "qr";
+    pendingPairingPhone = null;
+    lastPairingCode = null;
+    lastPairingCodeError = null;
+    lastQr = null;
+    lastQrDataUrl = null;
+    lastPairingCodeAt = 0;
+    // Wipe the auth folder.
+    const fs = require("fs");
+    const authDir = path.join(__dirname, ".wwebjs_auth");
+    try {
+      fs.rmSync(authDir, { recursive: true, force: true });
+    } catch (e) {
+      console.error("[wa] reset rm error:", e.message);
+    }
+    res.json({ ok: true });
+    setTimeout(() => {
+      client.initialize().catch((e) => console.error("[wa] reset re-init failed:", e.message));
+    }, 800);
+  } catch (e) {
+    console.error("[wa] reset error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ---- Boot --------------------------------------------------------------------

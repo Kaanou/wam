@@ -1,3 +1,2 @@
-2026/04/25-17:32:34.304 7e6 Reusing MANIFEST /app/whatsapp-service/.wwebjs_auth/session-main/Default/Sync Data/LevelDB/MANIFEST-000001
-2026/04/25-17:32:34.305 7e6 Recovering log #3
-2026/04/25-17:32:34.305 7e6 Reusing old log /app/whatsapp-service/.wwebjs_auth/session-main/Default/Sync Data/LevelDB/000003.log 
+2026/04/26-06:53:04.392 6e4 Creating DB /app/whatsapp-service/.wwebjs_auth/session-main/Default/Sync Data/LevelDB since it was missing.
+2026/04/26-06:53:04.399 6e4 Reusing MANIFEST /app/whatsapp-service/.wwebjs_auth/session-main/Default/Sync Data/LevelDB/MANIFEST-000001

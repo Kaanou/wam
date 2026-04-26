@@ -450,9 +450,11 @@ export default function App() {
   const [waState, setWaState] = useState({ state: "initializing", me: null });
   const [qrDataUrl, setQrDataUrl] = useState(null);
   const [pairingCode, setPairingCode] = useState(null);
+  const [pairingCodeError, setPairingCodeError] = useState(null);
   const [pairingMode, setPairingMode] = useState("qr"); // "qr" | "code"
   const [pairingPhone, setPairingPhone] = useState("");
   const [requestingCode, setRequestingCode] = useState(false);
+  const [resettingSession, setResettingSession] = useState(false);
   const [monitors, setMonitors] = useState([]);
   const [events, setEvents] = useState([]);
   const [settings, setSettings] = useState({});
@@ -510,6 +512,7 @@ export default function App() {
       setWaState(s.data);
       setQrDataUrl(q.data?.qr || null);
       setPairingCode(q.data?.code || null);
+      setPairingCodeError(q.data?.code_error || null);
       if (q.data?.mode) setPairingMode(q.data.mode);
       setMonitors(m.data || []);
       setEvents(e.data || []);
@@ -538,10 +541,12 @@ export default function App() {
           const q = await axios.get(`${API}/whatsapp/qr`);
           setQrDataUrl(q.data?.qr || null);
           setPairingCode(q.data?.code || null);
+          setPairingCodeError(q.data?.code_error || null);
           if (q.data?.mode) setPairingMode(q.data.mode);
         } else {
           setQrDataUrl(null);
           setPairingCode(null);
+          setPairingCodeError(null);
         }
       } catch {
         /* ignore */
@@ -718,6 +723,7 @@ export default function App() {
       return;
     }
     setRequestingCode(true);
+    setPairingCodeError(null);
     try {
       const r = await axios.post(`${API}/whatsapp/pairing-code`, { phone: cleaned });
       if (r.data?.code) {
@@ -729,10 +735,48 @@ export default function App() {
         toast("Code en attente, le QR doit d'abord être prêt...");
       }
     } catch (err) {
-      const detail = err?.response?.data?.detail || "Erreur";
-      toast.error(`Échec : ${detail}`);
+      const detail =
+        err?.response?.data?.detail ||
+        err?.message ||
+        "Échec inconnu";
+      setPairingCodeError(typeof detail === "string" ? detail : JSON.stringify(detail));
+      toast.error(typeof detail === "string" ? detail : "Échec");
     } finally {
       setRequestingCode(false);
+    }
+  };
+
+  const resetWhatsappSession = async () => {
+    if (
+      !window.confirm(
+        "Réinitialiser complètement la session WhatsApp ? Tous les monitors seront supprimés et un nouveau QR sera généré.",
+      )
+    )
+      return;
+    setResettingSession(true);
+    try {
+      await axios.post(`${API}/whatsapp/reset`);
+      setMonitors([]);
+      setPairingCode(null);
+      setPairingCodeError(null);
+      setQrDataUrl(null);
+      toast.success("Session réinitialisée. Un nouveau QR va apparaître dans quelques secondes...");
+    } catch (err) {
+      const detail = err?.response?.data?.detail || "Erreur";
+      toast.error(`Reset échoué : ${detail}`);
+    } finally {
+      setResettingSession(false);
+    }
+  };
+
+  const copyAppUrl = async () => {
+    const url = window.location.href.split("?")[0].replace(/\/$/, "");
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success("Lien copié — ouvrez-le sur un ordinateur ou un autre appareil pour scanner le QR");
+    } catch {
+      // Fallback: show URL in a prompt
+      window.prompt("Copiez ce lien et ouvrez-le sur un autre appareil :", url);
     }
   };
 
@@ -1111,11 +1155,11 @@ export default function App() {
                         <img
                           src={qrDataUrl}
                           alt="WhatsApp pairing QR code"
-                          className="block w-[240px] h-[240px]"
+                          className="block w-[280px] h-[280px] sm:w-[320px] sm:h-[320px]"
                         />
                       </div>
                     ) : (
-                      <div className="w-[240px] h-[240px] border border-dashed border-zinc-800 flex flex-col items-center justify-center text-zinc-600 gap-2">
+                      <div className="w-[280px] h-[280px] sm:w-[320px] sm:h-[320px] border border-dashed border-zinc-800 flex flex-col items-center justify-center text-zinc-600 gap-2">
                         <ScanLine size={32} strokeWidth={1.5} />
                         <span className="text-[10px] font-mono uppercase tracking-[0.18em]">
                           {waState.state === "unreachable"
@@ -1127,6 +1171,18 @@ export default function App() {
                     <p className="text-xs text-zinc-400 text-center font-mono leading-relaxed max-w-xs">
                       WhatsApp → Paramètres → Appareils liés → Scanner ce code.
                     </p>
+                    <div className="border border-amber-500/20 bg-amber-500/5 rounded-sm px-3 py-2 max-w-sm">
+                      <p className="text-[11px] font-mono text-amber-300/90 leading-relaxed">
+                        ⓘ Vous ne pouvez pas scanner ce QR avec le téléphone qui affiche cette page.
+                      </p>
+                      <button
+                        data-testid="copy-app-url-button"
+                        onClick={copyAppUrl}
+                        className="mt-2 w-full text-[10px] font-mono uppercase tracking-[0.18em] text-amber-200 hover:text-white border border-amber-500/30 hover:bg-amber-500/10 px-2 py-1.5 rounded-sm transition-colors"
+                      >
+                        Copier le lien · ouvrir sur un autre appareil
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="flex flex-col gap-3">
@@ -1165,20 +1221,43 @@ export default function App() {
                       {pairingCode ? (
                         <div className="text-center">
                           <div className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-2">
-                            Votre code de pairing
+                            Votre code de pairing · valide ~60 s
                           </div>
                           <div className="font-mono text-3xl tracking-[0.4em] text-emerald-400 select-all">
                             {pairingCode}
                           </div>
                         </div>
                       ) : (
-                        <span className="text-[11px] font-mono text-zinc-600 uppercase tracking-[0.18em]">
+                        <span className="text-[11px] font-mono text-zinc-600 uppercase tracking-[0.18em] text-center">
                           {requestingCode ? "génération..." : "code non encore généré"}
                         </span>
                       )}
                     </div>
+                    {pairingCodeError && (
+                      <div
+                        data-testid="pairing-code-error"
+                        className="border border-red-500/30 bg-red-500/10 rounded-sm px-3 py-2"
+                      >
+                        <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-red-400 mb-1">
+                          Échec de la demande
+                        </div>
+                        <p className="text-[11px] font-mono text-red-300/90 leading-relaxed">
+                          {pairingCodeError}
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
+
+                {/* Reset session — visible whenever not paired, useful after rate-limit */}
+                <button
+                  data-testid="reset-session-button"
+                  onClick={resetWhatsappSession}
+                  disabled={resettingSession}
+                  className="mt-2 w-full text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500 hover:text-red-400 border border-zinc-800 hover:border-red-500/30 hover:bg-red-500/5 px-2 py-2 rounded-sm transition-colors disabled:opacity-50"
+                >
+                  {resettingSession ? "Réinitialisation..." : "↺ Réinitialiser la session WhatsApp"}
+                </button>
               </div>
             )}
           </Panel>

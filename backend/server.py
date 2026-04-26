@@ -632,6 +632,18 @@ async def whatsapp_logout():
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@api_router.post("/whatsapp/reset")
+async def whatsapp_reset():
+    """Hard reset: wipe local WhatsApp session + monitors and force re-pairing.
+    Useful to recover from rate-limit / stuck QR loops."""
+    try:
+        r = await wa_request("POST", "/reset")
+        await db.monitors.delete_many({})
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @api_router.get("/monitors", response_model=List[Monitor])
 async def list_monitors():
     docs = await db.monitors.find({}, {"_id": 0}).sort("added_at", -1).to_list(500)
