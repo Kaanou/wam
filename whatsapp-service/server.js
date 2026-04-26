@@ -204,18 +204,100 @@ async function pollPresenceLoop() {
         try {
           const chat = await client.getChatById(entry.jid);
           if (!chat) continue;
-          // Subscribe / refresh presence — fires presence_update when received.
+          // Fetch current presence — returns { isOnline, lastSeen, ... } when
+          // the contact's privacy allows it. We use this DIRECTLY rather than
+          // waiting for the (unreliable) presence_update event.
+          let presence = null;
           if (typeof chat.fetchPresence === "function") {
-            await chat.fetchPresence().catch(() => {});
+            presence = await chat.fetchPresence().catch((e) => {
+              console.warn(`[wa] fetchPresence ${phone}:`, e?.message);
+              return null;
+            });
+          }
+          if (!presence) continue;
+
+          const nowIso = new Date().toISOString();
+
+          // Capture lastSeen if WhatsApp publishes it.
+          if (typeof presence.lastSeen === "number" && presence.lastSeen > 0) {
+            const lsIso = new Date(presence.lastSeen * 1000).toISOString();
+            if (entry.lastSeenPublic !== lsIso) {
+              entry.lastSeenPublic = lsIso;
+              postEvent({
+                type: "last_seen_update",
+                phone,
+                last_seen_public: lsIso,
+                timestamp: nowIso,
+              });
+            }
+          }
+
+          // Direct online/offline from presence object
+          if (typeof presence.isOnline === "boolean") {
+            const newStatus = presence.isOnline ? "online" : "offline";
+            if (entry.status !== newStatus) {
+              entry.status = newStatus;
+              entry.lastSeen = nowIso;
+              monitored.set(phone, entry);
+              postEvent({
+                type: "presence",
+                phone,
+                status: newStatus,
+                timestamp: nowIso,
+              });
+            }
           }
         } catch (err) {
-          // ignore — chat may not exist yet
+          console.warn(`[wa] poll ${phone}:`, err?.message);
         }
       }
     }
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
 }
+
+// Diagnostic endpoint: returns the raw fetchPresence result for a phone.
+// Helps users diagnose why a monitor is stuck on UNKNOWN.
+app.get("/debug-presence/:phone", async (req, res) => {
+  const phone = String(req.params.phone).replace(/[^0-9]/g, "");
+  if (clientState !== "ready") {
+    return res.status(409).json({ error: "whatsapp not ready", state: clientState });
+  }
+  try {
+    const numberId = await client.getNumberId(phone);
+    if (!numberId) return res.status(404).json({ error: "number not on whatsapp" });
+    const jid = numberId._serialized;
+    const chat = await client.getChatById(jid);
+    if (!chat) return res.status(404).json({ error: "chat not found" });
+
+    let presence = null;
+    let presenceError = null;
+    try {
+      presence = await chat.fetchPresence();
+    } catch (e) {
+      presenceError = String(e?.message || e);
+    }
+    const me = client.info?.wid?._serialized;
+    const isSelf = me === jid;
+    return res.json({
+      phone,
+      jid,
+      is_self: isSelf,
+      paired_as: me,
+      presence,
+      presence_error: presenceError,
+      hint: isSelf
+        ? "Vous surveillez votre propre numéro — WhatsApp ne pousse pas la présence vers la même session. Ajoutez un AUTRE numéro."
+        : presence == null
+        ? "fetchPresence a retourné null — généralement privacy 'Vu à' du contact restreinte à 'Personne' ou 'Mes contacts' (et vous n'êtes pas dans ses contacts)."
+        : presence.isOnline === undefined
+        ? "WhatsApp a renvoyé un objet sans champ isOnline — privacy partielle probable."
+        : "OK, présence reçue.",
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 // ---- Profile polling --------------------------------------------------------
 // Every PROFILE_POLL_MS, fetch profile pic, name and about for each monitored

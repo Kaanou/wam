@@ -651,6 +651,18 @@ async def whatsapp_logout():
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@api_router.get("/whatsapp/debug-presence/{phone}")
+async def whatsapp_debug_presence(phone: str):
+    """Diagnostic — returns the raw presence result + a hint on why a monitor
+    might be stuck on UNKNOWN (own number, privacy, etc.)."""
+    phone = "".join(ch for ch in phone if ch.isdigit())
+    try:
+        r = await wa_request("GET", f"/debug-presence/{phone}")
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @api_router.post("/whatsapp/reset")
 async def whatsapp_reset():
     """Hard reset: wipe local WhatsApp session + monitors and force re-pairing.
