@@ -42,7 +42,25 @@
 - **Validation**: `email_enabled=true` now requires `email_recipient`; `daily_summary_hour` clamped to 0-23.
 - 28/28 backend tests passing.
 
-## Implemented (2026-04-26 — iteration 3)
+## Implemented (2026-04-26 — iteration 4)
+- **Composing/recording detection** : whatsapp-web.js capte les états `composing` (tape) et `recording` (audio). Forwardé comme événements internes `activity`, stocké dans events avec event_type=`composing`/`recording`, badge cyan/fuchsia dans le log + toast en direct.
+- **Last seen public tracking** : si le contact laisse son "vu à" public, on capture la valeur via `presence.lastSeen` et on la stocke dans `monitors.last_seen_public`. Affiché dans la liste des monitors en cyan.
+- **Profile polling toutes les 30 min** : nouveau loop côté Node sidecar qui récupère `getProfilePicUrl`, `pushname`, `getAbout()` pour chaque monitor. Première capture stockée comme baseline. Changements ultérieurs détectés et émis comme `profile_change` events.
+- **Profile snapshots collection** + endpoint `GET /api/profile-snapshots?phone=X` : timeline des photos/noms/about avec horodatage.
+- **Analytics endpoints** :
+  - `GET /api/analytics/heatmap?phone=X&days=28` : grid 7×24 (jour×heure UTC) en minutes online sur N jours.
+  - `GET /api/analytics/anomalies?phone=X` : détection d'écarts statistiques (z-score sample variance, n≥5) du jour courant vs. baseline historique.
+  - `GET /api/analytics/correlations?days=14` : pour chaque paire de monitors, minutes & % d'overlap online ; classé top 20.
+- **Backup/Restore** : `GET /api/backup` JSON complet ; `POST /api/backup/restore?replace=true|false` (avec guard de version v1).
+- **PWA installable** : manifest.json + sw.js + meta tags iOS (apple-mobile-web-app-capable). Sur iPhone Safari → Partager → "Sur l'écran d'accueil" pour avoir une icône avec mode standalone.
+- **Frontend** :
+  - Monitor row : bouton expand → panneau inline avec heatmap (gradient zinc→emerald), liste des anomalies du jour, timeline visuelle des changements de profil (photo, nom, about).
+  - Nouveau panneau **Correlations** sous Monitors (visible si ≥2 numéros).
+  - Backup · Export JSON / Restore dans le panneau Notifications.
+  - Activity log : nouveaux types affichés (TYPING cyan, AUDIO fuchsia, PROFILE violet) + filtres correspondants.
+- **73/74 backend tests passing** (25/25 nouveaux iter4 + 48/49 anciens — le 1 échouant est order-flaky non lié à iter4).
+
+## Implemented (2026-04-26 — iteration 3 · alert rules)
 - **Customizable alert rules** with 3 types:
   - `forbidden_online` : alerte si online dans la plage choisie
   - `expected_online` : alerte si offline > grace_minutes pendant la plage choisie

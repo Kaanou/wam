@@ -1041,10 +1041,11 @@ async def analytics_anomalies(phone: str, days_baseline: int = 28):
     for dow in range(7):
         for h in range(24):
             samples = [g[dow][h] for g in baseline_days if g[dow][h] > 0]
-            if len(samples) < 2:
+            if len(samples) < 5:
                 continue
             mean = sum(samples) / len(samples)
-            var = sum((x - mean) ** 2 for x in samples) / len(samples)
+            # sample variance (n-1) — fewer false positives on small n
+            var = sum((x - mean) ** 2 for x in samples) / (len(samples) - 1)
             std = var ** 0.5
             today_val = today_grid[dow][h]
             if dow != now.weekday():
@@ -1197,6 +1198,11 @@ async def backup():
 @api_router.post("/backup/restore")
 async def restore_backup(payload: BackupPayload, replace: bool = True):
     """Restore from a backup. By default replaces all data (replace=true)."""
+    if payload.version != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported backup version {payload.version} (expected 1)",
+        )
     if replace:
         await db.monitors.delete_many({})
         await db.events.delete_many({})
