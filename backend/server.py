@@ -104,6 +104,54 @@ class PairingCodeRequest(BaseModel):
     phone: str
 
 
+class AlertRule(BaseModel):
+    """A user-defined alert rule.
+
+    type:
+      * forbidden_online  — fire if the contact is ONLINE inside the window.
+      * expected_online   — fire if the contact is OFFLINE for more than
+        `grace_minutes` consecutive minutes inside the window.
+      * inactivity        — fire if no `online` event has been seen in the
+        last `max_silence_hours` hours (window/days ignored).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    phone: str
+    name: str
+    type: str  # forbidden_online | expected_online | inactivity
+    enabled: bool = True
+    days_of_week: List[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])  # 0=Mon
+    start_hour: int = 0
+    end_hour: int = 24
+    grace_minutes: int = 30
+    max_silence_hours: int = 24
+    last_triggered_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class AlertRuleCreate(BaseModel):
+    phone: str
+    name: str
+    type: str
+    enabled: bool = True
+    days_of_week: Optional[List[int]] = None
+    start_hour: int = 0
+    end_hour: int = 24
+    grace_minutes: int = 30
+    max_silence_hours: int = 24
+
+
+class AlertRulePatch(BaseModel):
+    name: Optional[str] = None
+    enabled: Optional[bool] = None
+    days_of_week: Optional[List[int]] = None
+    start_hour: Optional[int] = None
+    end_hour: Optional[int] = None
+    grace_minutes: Optional[int] = None
+    max_silence_hours: Optional[int] = None
+
+
 class InternalEvent(BaseModel):
     type: str  # presence | client_state
     phone: Optional[str] = None
@@ -353,6 +401,173 @@ async def daily_summary_loop() -> None:
             await asyncio.sleep(60)  # avoid tight error loop
 
 
+# ---- Alert rules evaluator --------------------------------------------------
+ALERT_COOLDOWN_SECONDS = 3600  # 1h between two triggers of the same rule
+
+
+def _in_window(now: datetime, rule: dict) -> bool:
+    days = rule.get("days_of_week") or list(range(7))
+    if now.weekday() not in days:
+        return False
+    h = now.hour
+    start = int(rule.get("start_hour", 0))
+    end = int(rule.get("end_hour", 24))
+    if start <= end:
+        return start <= h < end
+    # Wraps midnight (e.g. 22 → 6)
+    return h >= start or h < end
+
+
+async def _last_online_event_ts(phone: str) -> Optional[datetime]:
+    docs = await db.events.find(
+        {"phone": phone, "event_type": "online"},
+        {"_id": 0},
+    ).sort("timestamp", -1).limit(1).to_list(1)
+    if not docs:
+        return None
+    ts = docs[0]["timestamp"]
+    return datetime.fromisoformat(ts) if isinstance(ts, str) else ts
+
+
+async def _evaluate_rule(rule: dict, monitor: Optional[dict], now: datetime) -> Optional[str]:
+    """Return alert message string if rule should fire, else None."""
+    last_trig = rule.get("last_triggered_at")
+    if last_trig:
+        last_dt = datetime.fromisoformat(last_trig) if isinstance(last_trig, str) else last_trig
+        if (now - last_dt).total_seconds() < ALERT_COOLDOWN_SECONDS:
+            return None
+
+    rtype = rule.get("type")
+    phone = rule.get("phone", "")
+    label = (monitor or {}).get("label") or ""
+    pretty = f"+{phone}" + (f" ({label})" if label else "")
+
+    if rtype == "forbidden_online":
+        if not _in_window(now, rule):
+            return None
+        if monitor and monitor.get("status") == "online":
+            return f"{pretty} est ONLINE pendant la plage interdite."
+        return None
+
+    if rtype == "expected_online":
+        if not _in_window(now, rule):
+            return None
+        if not monitor:
+            return None
+        if monitor.get("status") == "online":
+            return None
+        # Find when the contact was last online
+        last_online = await _last_online_event_ts(phone)
+        # Reference start = max(last_online, today's window start)
+        window_start = now.replace(
+            hour=int(rule.get("start_hour", 0)), minute=0, second=0, microsecond=0
+        )
+        ref = window_start
+        if last_online and last_online > ref:
+            ref = last_online
+        offline_minutes = (now - ref).total_seconds() / 60
+        if offline_minutes >= int(rule.get("grace_minutes", 30)):
+            return f"{pretty} est OFFLINE depuis {int(offline_minutes)}min (attendu online)."
+        return None
+
+    if rtype == "inactivity":
+        last_online = await _last_online_event_ts(phone)
+        if last_online is None:
+            # Never seen online — use monitor.added_at as reference
+            added = (monitor or {}).get("added_at")
+            if isinstance(added, str):
+                added = datetime.fromisoformat(added)
+            if not added:
+                return None
+            last_online = added
+        hours_silent = (now - last_online).total_seconds() / 3600
+        if hours_silent >= int(rule.get("max_silence_hours", 24)):
+            return f"{pretty} sans activité depuis {int(hours_silent)}h."
+        return None
+
+    return None
+
+
+async def _trigger_alert(rule: dict, message: str, now: datetime) -> None:
+    ev_id = str(uuid.uuid4())
+    detail = f"[{rule.get('name', 'alert')}] {message}"
+    ev_doc = {
+        "id": ev_id,
+        "phone": rule.get("phone", ""),
+        "event_type": "alert",
+        "timestamp": iso(now),
+        "detail": detail,
+    }
+    await db.events.insert_one(ev_doc.copy())
+    await db.alert_rules.update_one(
+        {"id": rule["id"]}, {"$set": {"last_triggered_at": iso(now)}}
+    )
+    await ws_manager.broadcast(
+        {
+            "type": "alert",
+            "id": ev_id,
+            "phone": rule.get("phone", ""),
+            "message": message,
+            "rule_name": rule.get("name", "alert"),
+            "timestamp": iso(now),
+        }
+    )
+    # Email if configured
+    settings = await get_settings()
+    if settings.email_enabled and settings.email_recipient and RESEND_API_KEY:
+        try:
+            html = f"""
+            <table width="100%" cellpadding="0" cellspacing="0" style="font-family:Arial,sans-serif;background:#09090b;color:#fafafa;padding:24px">
+              <tr><td>
+                <h2 style="margin:0 0 8px 0;color:#ef4444">Alert · {rule.get('name', 'rule')}</h2>
+                <p style="margin:0 0 16px 0;color:#a1a1aa">{message}</p>
+                <table cellpadding="6" style="border:1px solid #27272a;border-radius:4px;font-family:monospace;font-size:13px">
+                  <tr><td style="color:#71717a">RULE</td><td style="color:#fafafa">{rule.get('name', '')}</td></tr>
+                  <tr><td style="color:#71717a">PHONE</td><td style="color:#fafafa">+{rule.get('phone', '')}</td></tr>
+                  <tr><td style="color:#71717a">TYPE</td><td style="color:#fafafa">{rule.get('type', '')}</td></tr>
+                  <tr><td style="color:#71717a">TIMESTAMP</td><td style="color:#fafafa">{iso(now)}</td></tr>
+                </table>
+              </td></tr>
+            </table>
+            """
+            await asyncio.to_thread(
+                resend.Emails.send,
+                {
+                    "from": SENDER_EMAIL,
+                    "to": [settings.email_recipient],
+                    "subject": f"[WA Monitor · ALERT] {rule.get('name', '')}",
+                    "html": html,
+                },
+            )
+        except Exception as e:
+            logger.error(f"alert email failed: {e}")
+
+
+async def alert_evaluator_loop() -> None:
+    """Every 60s: evaluate every enabled alert rule, trigger if needed."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = now_utc()
+            rules = await db.alert_rules.find({"enabled": True}, {"_id": 0}).to_list(500)
+            if not rules:
+                continue
+            # Pre-load monitors keyed by phone
+            monitors = await db.monitors.find({}, {"_id": 0}).to_list(500)
+            monitors_by_phone = {m["phone"]: m for m in monitors}
+            for rule in rules:
+                try:
+                    monitor = monitors_by_phone.get(rule.get("phone", ""))
+                    msg = await _evaluate_rule(rule, monitor, now)
+                    if msg:
+                        await _trigger_alert(rule, msg, now)
+                except Exception as e:
+                    logger.error(f"rule {rule.get('id')} eval error: {e}")
+        except Exception as e:
+            logger.error(f"alert_evaluator_loop error: {e}")
+            await asyncio.sleep(60)
+
+
 # ---- Routes -----------------------------------------------------------------
 @api_router.get("/")
 async def root():
@@ -591,6 +806,86 @@ async def send_summary_now():
     return {"ok": True}
 
 
+# ---- Alert rules ------------------------------------------------------------
+ALERT_TYPES = {"forbidden_online", "expected_online", "inactivity"}
+
+
+@api_router.get("/alert-rules", response_model=List[AlertRule])
+async def list_alert_rules():
+    docs = await db.alert_rules.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    out: List[AlertRule] = []
+    for d in docs:
+        if isinstance(d.get("created_at"), str):
+            d["created_at"] = datetime.fromisoformat(d["created_at"])
+        if isinstance(d.get("last_triggered_at"), str):
+            d["last_triggered_at"] = datetime.fromisoformat(d["last_triggered_at"])
+        out.append(AlertRule(**d))
+    return out
+
+
+@api_router.post("/alert-rules", response_model=AlertRule)
+async def create_alert_rule(payload: AlertRuleCreate):
+    if payload.type not in ALERT_TYPES:
+        raise HTTPException(status_code=400, detail=f"type must be one of {sorted(ALERT_TYPES)}")
+    phone = "".join(ch for ch in payload.phone if ch.isdigit())
+    if not phone or len(phone) < 7:
+        raise HTTPException(status_code=400, detail="invalid phone")
+    days = payload.days_of_week if payload.days_of_week is not None else [0, 1, 2, 3, 4, 5, 6]
+    days = sorted({int(d) for d in days if 0 <= int(d) <= 6})
+    rule = AlertRule(
+        id=str(uuid.uuid4()),
+        phone=phone,
+        name=payload.name.strip() or f"Alert {phone}",
+        type=payload.type,
+        enabled=payload.enabled,
+        days_of_week=days,
+        start_hour=max(0, min(23, payload.start_hour)),
+        end_hour=max(0, min(24, payload.end_hour)),
+        grace_minutes=max(1, payload.grace_minutes),
+        max_silence_hours=max(1, payload.max_silence_hours),
+        last_triggered_at=None,
+        created_at=now_utc(),
+    )
+    doc = rule.model_dump()
+    doc["created_at"] = iso(doc["created_at"])
+    doc["last_triggered_at"] = None
+    await db.alert_rules.insert_one(doc)
+    await ws_manager.broadcast({"type": "alert_rule_added"})
+    return rule
+
+
+@api_router.patch("/alert-rules/{rule_id}", response_model=AlertRule)
+async def patch_alert_rule(rule_id: str, payload: AlertRulePatch):
+    update: dict = {}
+    for field in ("name", "enabled", "start_hour", "end_hour", "grace_minutes", "max_silence_hours"):
+        v = getattr(payload, field)
+        if v is not None:
+            update[field] = v
+    if payload.days_of_week is not None:
+        update["days_of_week"] = sorted({int(d) for d in payload.days_of_week if 0 <= int(d) <= 6})
+    if not update:
+        raise HTTPException(status_code=400, detail="no fields to update")
+    res = await db.alert_rules.update_one({"id": rule_id}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="rule not found")
+    doc = await db.alert_rules.find_one({"id": rule_id}, {"_id": 0})
+    if isinstance(doc.get("created_at"), str):
+        doc["created_at"] = datetime.fromisoformat(doc["created_at"])
+    if isinstance(doc.get("last_triggered_at"), str):
+        doc["last_triggered_at"] = datetime.fromisoformat(doc["last_triggered_at"])
+    await ws_manager.broadcast({"type": "alert_rule_updated"})
+    return AlertRule(**doc)
+
+
+@api_router.delete("/alert-rules/{rule_id}")
+async def delete_alert_rule(rule_id: str):
+    res = await db.alert_rules.delete_one({"id": rule_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="rule not found")
+    await ws_manager.broadcast({"type": "alert_rule_removed", "id": rule_id})
+    return {"ok": True}
+
+
 # ---- Internal webhook auth --------------------------------------------------
 def verify_internal_secret(x_internal_secret: Optional[str]) -> None:
     if not INTERNAL_API_SECRET:
@@ -691,3 +986,4 @@ async def shutdown_db_client():
 @app.on_event("startup")
 async def _on_startup():
     asyncio.create_task(daily_summary_loop())
+    asyncio.create_task(alert_evaluator_loop())

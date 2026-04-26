@@ -1,0 +1,45 @@
+{
+  "summary": "Backend testing complete for iteration 3 (customizable alert rules). 49/49 tests passed (21 new iteration-3 tests + 28 iteration-1/2 regression tests, 100%). Coverage: GET /api/alert-rules (empty + sorted desc by created_at), POST with all 3 valid types (forbidden_online, expected_online with grace_minutes, inactivity with max_silence_hours), POST validation (invalid type -> 400 with helpful list of valid types, invalid phone -> 400, days_of_week sanitization drops 9 -> [0,3], start_hour=30 -> clamped to 23), PATCH (enabled=false, multi-field name+days_of_week+grace_minutes, empty body -> 400, nonexistent rule -> 404), DELETE (returns {ok:true} + 404 on second delete). Trigger logic was verified by directly importing _evaluate_rule and _trigger_alert from server.py and invoking them with seeded MongoDB data: forbidden_online fires when monitor.status=online and now is in window, alert event is inserted with detail '[<rule_name>] <message>', last_triggered_at is updated, ALERT_COOLDOWN_SECONDS=3600 suppresses immediate retrigger, and re-fires after cooldown expires; out-of-window evaluation does not fire; inactivity rule fires when last online event > max_silence_hours ago. Regression smoke (whatsapp/status, monitors, events, settings) all green.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/alert-rules", "issue": "end_hour is clamped to max 24 but minimum allowed is 0; semantics of start_hour > end_hour (window wraps midnight) work in _in_window but are not documented at the API surface. Consider rejecting end_hour==start_hour (zero-width window) or documenting the wrap behavior."},
+      {"endpoint": "POST /api/alert-rules", "issue": "When `name` is a whitespace-only string the code falls back to `Alert <phone>` via `payload.name.strip() or f'Alert {phone}'` — but this is silent. A 400 'name is required' would be cleaner."},
+      {"endpoint": "PATCH /api/alert-rules/{id}", "issue": "No clamping is applied on PATCH (start_hour/end_hour/grace_minutes/max_silence_hours) — a user can PATCH start_hour=99 and it persists raw. Create-time validation is enforced but update-time is not. Mirror the clamping rules from POST."},
+      {"endpoint": "_evaluate_rule (expected_online)", "issue": "window_start is computed via `now.replace(hour=start_hour, ...)` which silently breaks for windows that wrap midnight (start_hour>end_hour) — for those rules `window_start` is set to *today* at the late hour, so before the wrap point the offline duration is negative. Consider handling the wrap case explicitly."},
+      {"endpoint": "_trigger_alert", "issue": "Alert email send is not gated by an alert-specific flag — it reuses settings.email_enabled (the same flag that controls per-presence-change emails). Users who want presence emails but no alert spam (or vice-versa) cannot configure that. Consider a separate alert_email_enabled."},
+      {"endpoint": "alert_evaluator_loop", "issue": "Catches Exception inside the rule loop but on outer error sleeps another 60s after the initial 60s sleep — the first sleep at top of try is the only pacing; a tight error path would loop fast. Same pattern as daily_summary_loop flagged in iteration 2."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_alert_rules.py",
+    "/app/backend/tests/test_wa_monitor.py",
+    "/app/test_reports/pytest/iter3_alert_rules.xml",
+    "/app/test_reports/pytest/iter3_regression.xml"
+  ],
+  "action_items": [
+    "Optional: enforce clamping & validation on PATCH /api/alert-rules/{id} for start_hour/end_hour/grace_minutes/max_silence_hours to mirror POST.",
+    "Optional: handle midnight-wrap windows in _evaluate_rule (expected_online) so window_start is computed correctly when start_hour > end_hour.",
+    "Optional: add a dedicated `alert_email_enabled` setting separate from `email_enabled` (presence emails).",
+    "Carryover: split server.py (~990 lines now) into routers/ + services/ modules — alerts, daily summary, internal webhook, models."
+  ],
+  "critical_code_review_comments": [
+    "server.py grew from ~700 to ~990 lines after iteration 3 — split into modules (routers/alert_rules.py, services/alerts.py, services/scheduler.py, models.py).",
+    "_evaluate_rule mixes rule-validation, DB lookups, and message formatting; extract per-type evaluators (evaluate_forbidden_online / evaluate_expected_online / evaluate_inactivity) for unit testability.",
+    "PATCH endpoint accepts unbounded integers (no clamp) — easy bypass of POST validation.",
+    "ALERT_TYPES, ALERT_COOLDOWN_SECONDS hardcoded — promote to env vars or settings.",
+    "_trigger_alert inserts the event and broadcasts BEFORE updating last_triggered_at; if the update fails the alert can fire repeatedly. Consider transaction or update-first semantics.",
+    "alert_evaluator_loop loads ALL monitors (to_list(500)) every minute even when only a few rules exist — fine at this scale but fetch only monitors for phones referenced by enabled rules."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_alert_rules.py (new, 21 tests)"
+  ],
+  "success_rate": {"backend": "100% (49/49 — 21 new + 28 regression)", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "n/a — INTERNAL_API_SECRET=wa-mon-3f9c1a8b6d2e4f7a8c1b9d3e5f6a2b4c read from /app/backend/.env",
+  "seed_data_creation": "Tests seed data directly into MongoDB via motor (test phones 33699887766, 33655443322, 33644445555). Trigger test seeds a monitor with status='online' and a forbidden_online rule covering all weekdays/hours, then directly invokes server._evaluate_rule + server._trigger_alert (rebinding server.db to a client bound to the per-test asyncio loop to avoid 'Event loop is closed'). Cleanup deletes all test rules/monitors/events before & after the run.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "WA client still in 'qr' state. To exercise alert trigger flow without the 60s background loop, import server module and call server._evaluate_rule(rule, monitor, now) and server._trigger_alert(rule, msg, now). IMPORTANT: rebind `server.db = AsyncIOMotorClient(MONGO_URL)[DB_NAME]` inside each test's asyncio.run, otherwise motor's lazy IO loop binding triggers 'Event loop is closed' across tests. Iteration 3 added /api/alert-rules CRUD + alert_evaluator_loop + _evaluate_rule + _trigger_alert + ALERT_COOLDOWN_SECONDS=3600 + ALERT_TYPES={forbidden_online, expected_online, inactivity}. Email-on-alert path reuses settings.email_enabled + email_recipient + RESEND_API_KEY (verified by code path; not hard-tested via Resend in this iteration since it is fire-and-forget).",
+  "rca of the issue": "n/a — no failures."
+}

@@ -3,7 +3,10 @@ import axios from "axios";
 import { Toaster, toast } from "sonner";
 import {
   Activity,
+  AlertTriangle,
+  Calendar,
   CircleDot,
+  Clock,
   Download,
   Edit3,
   Info,
@@ -14,6 +17,7 @@ import {
   QrCode,
   RefreshCw,
   Send,
+  Shield,
   Trash2,
   Wifi,
   WifiOff,
@@ -116,6 +120,331 @@ const StatusPill = ({ status }) => {
   );
 };
 
+// ---------- Alert rule helpers ----------
+const DAY_LABELS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
+const ALERT_TYPE_META = {
+  forbidden_online: {
+    label: "Online interdit",
+    desc: "Alerte si le contact est online dans la plage choisie.",
+    needsWindow: true,
+    needsGrace: false,
+  },
+  expected_online: {
+    label: "Online attendu",
+    desc: "Alerte si offline > grace minutes pendant la plage choisie.",
+    needsWindow: true,
+    needsGrace: true,
+  },
+  inactivity: {
+    label: "Inactivité",
+    desc: "Alerte si aucune connexion depuis X heures (24/7).",
+    needsWindow: false,
+    needsGrace: false,
+  },
+};
+
+const RuleForm = ({ form, setForm, onToggleDay, monitors, isEditing, saving, onSave, onCancel }) => {
+  const meta = ALERT_TYPE_META[form.type] || ALERT_TYPE_META.expected_online;
+  return (
+    <div
+      data-testid="rule-form"
+      className="border border-zinc-800 bg-zinc-950/60 rounded-sm p-4 mb-4 space-y-4"
+    >
+      <div className="flex items-center justify-between">
+        <h3 className="text-[11px] font-mono uppercase tracking-[0.22em] text-zinc-300">
+          {isEditing ? "Modifier l'alerte" : "Nouvelle alerte"}
+        </h3>
+        <button
+          data-testid="rule-cancel"
+          onClick={onCancel}
+          className="text-zinc-500 hover:text-zinc-200"
+        >
+          <X size={14} strokeWidth={1.75} />
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+            Numéro
+          </label>
+          <select
+            data-testid="rule-phone-select"
+            value={form.phone}
+            onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))}
+            disabled={isEditing}
+            className="w-full bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 font-mono disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+          >
+            <option value="">— choisir —</option>
+            {monitors.map((m) => (
+              <option key={m.phone} value={m.phone}>
+                +{m.phone}
+                {m.label ? ` · ${m.label}` : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+            Nom de l'alerte
+          </label>
+          <input
+            data-testid="rule-name-input"
+            type="text"
+            placeholder="Ex: Travail 9-18h, Insomnie nuit, Silence 24h…"
+            value={form.name}
+            maxLength={60}
+            onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+            className="w-full bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 placeholder:text-zinc-600 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+          />
+        </div>
+      </div>
+
+      <div>
+        <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+          Type
+        </label>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+          {Object.entries(ALERT_TYPE_META).map(([key, m]) => (
+            <button
+              key={key}
+              data-testid={`rule-type-${key}`}
+              onClick={() => setForm((f) => ({ ...f, type: key }))}
+              disabled={isEditing}
+              className={`text-left p-3 border rounded-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                form.type === key
+                  ? "border-white bg-zinc-100/5"
+                  : "border-zinc-800 hover:border-zinc-700"
+              }`}
+            >
+              <div className="text-xs font-medium text-zinc-100">{m.label}</div>
+              <div className="text-[10px] font-mono text-zinc-500 leading-relaxed mt-1">
+                {m.desc}
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {meta.needsWindow && (
+        <div className="space-y-3">
+          <div>
+            <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+              <Calendar size={10} className="inline mr-1" /> Jours de la semaine
+            </label>
+            <div className="flex flex-wrap gap-1.5" data-testid="rule-days">
+              {DAY_LABELS.map((lab, i) => {
+                const active = form.days.includes(i);
+                return (
+                  <button
+                    key={i}
+                    data-testid={`rule-day-${i}`}
+                    onClick={() => onToggleDay(i)}
+                    className={`px-2.5 py-1 border rounded-sm font-mono text-[11px] uppercase tracking-[0.12em] transition-colors ${
+                      active
+                        ? "bg-zinc-100 text-zinc-950 border-zinc-100"
+                        : "border-zinc-800 text-zinc-500 hover:bg-zinc-900 hover:text-zinc-200"
+                    }`}
+                  >
+                    {lab}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+                <Clock size={10} className="inline mr-1" /> De (UTC)
+              </label>
+              <select
+                data-testid="rule-start-hour"
+                value={form.start_hour}
+                onChange={(e) => setForm((f) => ({ ...f, start_hour: Number(e.target.value) }))}
+                className="w-full bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+              >
+                {Array.from({ length: 24 }).map((_, h) => (
+                  <option key={h} value={h}>{String(h).padStart(2, "0")}:00</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+                <Clock size={10} className="inline mr-1" /> À (UTC)
+              </label>
+              <select
+                data-testid="rule-end-hour"
+                value={form.end_hour}
+                onChange={(e) => setForm((f) => ({ ...f, end_hour: Number(e.target.value) }))}
+                className="w-full bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+              >
+                {Array.from({ length: 25 }).map((_, h) => (
+                  <option key={h} value={h}>{String(h).padStart(2, "0")}:00</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {meta.needsGrace && (
+        <div>
+          <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+            Tolérance offline (minutes)
+          </label>
+          <input
+            data-testid="rule-grace"
+            type="number"
+            min="1"
+            max="720"
+            value={form.grace_minutes}
+            onChange={(e) =>
+              setForm((f) => ({ ...f, grace_minutes: Math.max(1, Number(e.target.value) || 1) }))
+            }
+            className="w-32 bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+          />
+          <p className="text-[10px] font-mono text-zinc-600 mt-1">
+            Déclenche si offline ≥ {form.grace_minutes} min consécutives dans la plage.
+          </p>
+        </div>
+      )}
+
+      {form.type === "inactivity" && (
+        <div>
+          <label className="block text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-1.5">
+            Silence maximum (heures)
+          </label>
+          <input
+            data-testid="rule-silence"
+            type="number"
+            min="1"
+            max="720"
+            value={form.max_silence_hours}
+            onChange={(e) =>
+              setForm((f) => ({
+                ...f,
+                max_silence_hours: Math.max(1, Number(e.target.value) || 1),
+              }))
+            }
+            className="w-32 bg-zinc-950 border border-zinc-800 px-3 py-2 text-sm text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+          />
+          <p className="text-[10px] font-mono text-zinc-600 mt-1">
+            Déclenche si aucun "online" depuis ≥ {form.max_silence_hours} h.
+          </p>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between border-t border-zinc-800 pt-3">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            data-testid="rule-enabled-toggle"
+            type="checkbox"
+            checked={form.enabled}
+            onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))}
+            className="sr-only peer"
+          />
+          <div className="w-9 h-5 bg-zinc-800 rounded-full peer peer-checked:bg-emerald-500 transition-colors relative after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:h-4 after:w-4 after:rounded-full after:transition-transform peer-checked:after:translate-x-4"></div>
+          <span className="text-xs text-zinc-300 font-mono uppercase tracking-[0.12em]">
+            {form.enabled ? "Activée" : "Désactivée"}
+          </span>
+        </label>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onCancel}
+            className="px-3 py-1.5 border border-zinc-800 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200 rounded-sm font-mono text-[11px] uppercase tracking-[0.18em] transition-colors"
+          >
+            Annuler
+          </button>
+          <button
+            data-testid="rule-save"
+            onClick={onSave}
+            disabled={saving}
+            className="px-4 py-1.5 bg-white text-zinc-950 hover:bg-zinc-200 disabled:bg-zinc-800 disabled:text-zinc-500 rounded-sm font-medium text-xs transition-colors"
+          >
+            {saving ? "Enregistrement..." : isEditing ? "Mettre à jour" : "Créer l'alerte"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const RuleRow = ({ rule, monitor, onToggle, onEdit, onDelete }) => {
+  const meta = ALERT_TYPE_META[rule.type] || {};
+  const hh = (h) => String(h).padStart(2, "0") + ":00";
+  let summary = "";
+  if (rule.type === "inactivity") {
+    summary = `≥ ${rule.max_silence_hours}h sans activité`;
+  } else {
+    const days = (rule.days_of_week || []).map((d) => DAY_LABELS[d]).join(" ");
+    summary = `${days} · ${hh(rule.start_hour)}–${hh(rule.end_hour)} UTC`;
+    if (rule.type === "expected_online") summary += ` · grace ${rule.grace_minutes}min`;
+  }
+  const phoneDisplay = `+${rule.phone}` + (monitor?.label ? ` · ${monitor.label}` : "");
+  return (
+    <li
+      data-testid={`rule-row-${rule.id}`}
+      className="flex items-start justify-between gap-3 py-3 -mx-4 px-4 hover:bg-zinc-900/40 transition-colors"
+    >
+      <div className="flex items-start gap-3 min-w-0 flex-1">
+        <div className={`mt-0.5 ${rule.enabled ? "text-emerald-400" : "text-zinc-700"}`}>
+          {rule.enabled ? (
+            <Shield size={16} strokeWidth={1.75} />
+          ) : (
+            <Shield size={16} strokeWidth={1.75} />
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm text-zinc-100 font-medium">{rule.name}</span>
+            <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500 px-1.5 py-0.5 border border-zinc-800 rounded-sm">
+              {meta.label || rule.type}
+            </span>
+          </div>
+          <div className="text-[11px] font-mono text-zinc-400 mt-1 truncate">
+            {phoneDisplay}
+          </div>
+          <div className="text-[11px] font-mono text-zinc-500 mt-0.5">{summary}</div>
+          {rule.last_triggered_at && (
+            <div className="text-[10px] font-mono text-red-400/80 mt-0.5 inline-flex items-center gap-1">
+              <AlertTriangle size={10} strokeWidth={1.75} />
+              dernier déclenchement · {fmtRelative(rule.last_triggered_at)}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5 shrink-0">
+        <label className="relative inline-flex items-center cursor-pointer mr-1" title="Activer/Désactiver">
+          <input
+            data-testid={`rule-toggle-${rule.id}`}
+            type="checkbox"
+            checked={!!rule.enabled}
+            onChange={onToggle}
+            className="sr-only peer"
+          />
+          <div className="w-9 h-5 bg-zinc-800 rounded-full peer peer-checked:bg-emerald-500 transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:h-4 after:w-4 after:rounded-full after:transition-transform peer-checked:after:translate-x-4"></div>
+        </label>
+        <button
+          data-testid={`rule-edit-${rule.id}`}
+          onClick={onEdit}
+          className="p-1.5 border border-zinc-800 hover:border-zinc-600 text-zinc-500 hover:text-zinc-100 rounded-sm transition-colors"
+          title="Editer"
+        >
+          <Edit3 size={13} strokeWidth={1.75} />
+        </button>
+        <button
+          data-testid={`rule-delete-${rule.id}`}
+          onClick={onDelete}
+          className="p-1.5 border border-zinc-800 hover:border-red-500/30 hover:bg-red-500/10 text-zinc-500 hover:text-red-400 rounded-sm transition-colors"
+          title="Supprimer"
+        >
+          <Trash2 size={13} strokeWidth={1.75} />
+        </button>
+      </div>
+    </li>
+  );
+};
+
 // ---------- main ----------
 export default function App() {
   const [waState, setWaState] = useState({ state: "initializing", me: null });
@@ -140,7 +469,26 @@ export default function App() {
   const [editingLabelValue, setEditingLabelValue] = useState("");
   // Activity log filters
   const [filterPhone, setFilterPhone] = useState("");
-  const [filterEvent, setFilterEvent] = useState(""); // ""|"online"|"offline"|"client_state"
+  const [filterEvent, setFilterEvent] = useState(""); // ""|"online"|"offline"|"client_state"|"alert"
+
+  // Alert rules
+  const [alertRules, setAlertRules] = useState([]);
+  const [showRuleForm, setShowRuleForm] = useState(false);
+  const [editingRuleId, setEditingRuleId] = useState(null);
+  const emptyRuleForm = {
+    phone: "",
+    name: "",
+    type: "expected_online",
+    days: [0, 1, 2, 3, 4],
+    start_hour: 9,
+    end_hour: 18,
+    grace_minutes: 30,
+    max_silence_hours: 24,
+    enabled: true,
+  };
+  const [ruleForm, setRuleForm] = useState(emptyRuleForm);
+  const [savingRule, setSavingRule] = useState(false);
+
   const wsRef = useRef(null);
   const liveFlashRef = useRef(new Set());
 
@@ -151,12 +499,13 @@ export default function App() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [s, q, m, e, st] = await Promise.all([
+      const [s, q, m, e, st, ar] = await Promise.all([
         axios.get(`${API}/whatsapp/status`),
         axios.get(`${API}/whatsapp/qr`),
         axios.get(`${API}/monitors`),
         axios.get(`${API}/events?limit=200`),
         axios.get(`${API}/settings`),
+        axios.get(`${API}/alert-rules`),
       ]);
       setWaState(s.data);
       setQrDataUrl(q.data?.qr || null);
@@ -165,6 +514,7 @@ export default function App() {
       setMonitors(m.data || []);
       setEvents(e.data || []);
       setSettings(st.data || {});
+      setAlertRules(ar.data || []);
       setEmailInput(st.data?.email_recipient || "");
       setEmailEnabled(!!st.data?.email_enabled);
       setSummaryEnabled(!!st.data?.daily_summary_enabled);
@@ -292,6 +642,34 @@ export default function App() {
       } else if (data.state === "disconnected") {
         toast.error("WhatsApp déconnecté");
       }
+    } else if (data.type === "alert") {
+      const { phone, message, rule_name, timestamp, id } = data;
+      // Refetch rules to pick up updated last_triggered_at
+      axios.get(`${API}/alert-rules`).then((r) => setAlertRules(r.data || []));
+      // Add to events list if matching filter
+      const matches =
+        (!filterPhone.trim() || (phone || "").includes(filterPhone.replace(/[^0-9]/g, ""))) &&
+        (!filterEvent || filterEvent === "alert");
+      if (matches) {
+        setEvents((prev) =>
+          [
+            { id, phone: phone || "", event_type: "alert", timestamp, detail: `[${rule_name}] ${message}` },
+            ...prev,
+          ].slice(0, 500),
+        );
+        liveFlashRef.current.add(id);
+        setTimeout(() => liveFlashRef.current.delete(id), 2000);
+      }
+      toast.error(`⚠ ${rule_name}`, { description: message });
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        try {
+          new Notification(`⚠ Alert · ${rule_name}`, { body: message });
+        } catch {
+          /* ignore */
+        }
+      }
+    } else if (data.type === "alert_rule_added" || data.type === "alert_rule_updated" || data.type === "alert_rule_removed") {
+      axios.get(`${API}/alert-rules`).then((r) => setAlertRules(r.data || []));
     } else if (data.type === "monitor_added" || data.type === "monitor_removed" || data.type === "monitor_updated") {
       axios.get(`${API}/monitors`).then((r) => setMonitors(r.data || []));
     }
@@ -424,6 +802,120 @@ export default function App() {
       toast.error(`Impossible d'envoyer : ${detail}`);
     } finally {
       setSendingSummary(false);
+    }
+  };
+
+  // ---------- Alert rules ----------
+  const openNewRuleForm = () => {
+    setRuleForm({
+      ...emptyRuleForm,
+      phone: monitors[0]?.phone || "",
+    });
+    setEditingRuleId(null);
+    setShowRuleForm(true);
+  };
+
+  const openEditRule = (r) => {
+    setRuleForm({
+      phone: r.phone,
+      name: r.name,
+      type: r.type,
+      days: r.days_of_week || [],
+      start_hour: r.start_hour,
+      end_hour: r.end_hour,
+      grace_minutes: r.grace_minutes,
+      max_silence_hours: r.max_silence_hours,
+      enabled: r.enabled,
+    });
+    setEditingRuleId(r.id);
+    setShowRuleForm(true);
+  };
+
+  const closeRuleForm = () => {
+    setShowRuleForm(false);
+    setEditingRuleId(null);
+    setRuleForm(emptyRuleForm);
+  };
+
+  const toggleDay = (d) => {
+    setRuleForm((f) => {
+      const has = f.days.includes(d);
+      return { ...f, days: has ? f.days.filter((x) => x !== d) : [...f.days, d].sort() };
+    });
+  };
+
+  const saveRule = async () => {
+    if (!ruleForm.phone) {
+      toast.error("Choisissez un numéro à surveiller.");
+      return;
+    }
+    if (!ruleForm.name.trim()) {
+      toast.error("Donnez un nom à l'alerte.");
+      return;
+    }
+    if (ruleForm.type !== "inactivity" && ruleForm.days.length === 0) {
+      toast.error("Sélectionnez au moins un jour.");
+      return;
+    }
+    setSavingRule(true);
+    try {
+      if (editingRuleId) {
+        const payload = {
+          name: ruleForm.name.trim(),
+          enabled: ruleForm.enabled,
+          days_of_week: ruleForm.days,
+          start_hour: ruleForm.start_hour,
+          end_hour: ruleForm.end_hour,
+          grace_minutes: ruleForm.grace_minutes,
+          max_silence_hours: ruleForm.max_silence_hours,
+        };
+        await axios.patch(`${API}/alert-rules/${editingRuleId}`, payload);
+        toast.success("Alerte mise à jour");
+      } else {
+        const payload = {
+          phone: ruleForm.phone,
+          name: ruleForm.name.trim(),
+          type: ruleForm.type,
+          enabled: ruleForm.enabled,
+          days_of_week: ruleForm.days,
+          start_hour: ruleForm.start_hour,
+          end_hour: ruleForm.end_hour,
+          grace_minutes: ruleForm.grace_minutes,
+          max_silence_hours: ruleForm.max_silence_hours,
+        };
+        await axios.post(`${API}/alert-rules`, payload);
+        toast.success("Alerte créée");
+      }
+      const r = await axios.get(`${API}/alert-rules`);
+      setAlertRules(r.data || []);
+      closeRuleForm();
+    } catch (err) {
+      const detail = err?.response?.data?.detail || "Erreur";
+      toast.error(`Impossible : ${typeof detail === "string" ? detail : JSON.stringify(detail)}`);
+    } finally {
+      setSavingRule(false);
+    }
+  };
+
+  const toggleRuleEnabled = async (rule) => {
+    try {
+      await axios.patch(`${API}/alert-rules/${rule.id}`, { enabled: !rule.enabled });
+      setAlertRules((prev) =>
+        prev.map((r) => (r.id === rule.id ? { ...r, enabled: !r.enabled } : r)),
+      );
+    } catch {
+      toast.error("Erreur lors de la mise à jour");
+    }
+  };
+
+  const deleteRule = async (id) => {
+    if (!window.confirm("Supprimer cette alerte ?")) return;
+    try {
+      await axios.delete(`${API}/alert-rules/${id}`);
+      setAlertRules((prev) => prev.filter((r) => r.id !== id));
+      toast("Alerte supprimée");
+    } catch {
+      toast.error("Erreur lors de la suppression");
     }
   };
 
@@ -984,6 +1476,66 @@ export default function App() {
           )}
         </Panel>
 
+        {/* Alert Rules */}
+        <Panel
+          title="Alert Rules"
+          icon={Shield}
+          testid="panel-alert-rules"
+          right={
+            <div className="flex items-center gap-3">
+              <span className="text-[10px] font-mono text-zinc-600">
+                {alertRules.filter((r) => r.enabled).length}/{alertRules.length} active
+              </span>
+              <button
+                data-testid="new-rule-button"
+                onClick={openNewRuleForm}
+                disabled={monitors.length === 0}
+                className="inline-flex items-center gap-1 px-2 py-1 border border-zinc-700 hover:bg-zinc-800 hover:text-white text-zinc-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-sm font-mono text-[10px] uppercase tracking-[0.18em] transition-colors"
+              >
+                <Plus size={11} strokeWidth={1.75} /> new
+              </button>
+            </div>
+          }
+        >
+          {showRuleForm && (
+            <RuleForm
+              form={ruleForm}
+              setForm={setRuleForm}
+              onToggleDay={toggleDay}
+              monitors={monitors}
+              isEditing={!!editingRuleId}
+              saving={savingRule}
+              onSave={saveRule}
+              onCancel={closeRuleForm}
+            />
+          )}
+
+          {alertRules.length === 0 && !showRuleForm ? (
+            <div className="py-10 flex flex-col items-center gap-2 text-zinc-600">
+              <Shield size={28} strokeWidth={1.25} />
+              <p className="text-sm font-mono">Aucune alerte configurée.</p>
+              <p className="text-[11px] font-mono text-zinc-700 max-w-md text-center">
+                {monitors.length === 0
+                  ? "Ajoutez d'abord un numéro à surveiller."
+                  : 'Cliquez sur "new" pour créer une alerte personnalisée.'}
+              </p>
+            </div>
+          ) : (
+            <ul className="divide-y divide-zinc-800" data-testid="alert-rules-list">
+              {alertRules.map((r) => (
+                <RuleRow
+                  key={r.id}
+                  rule={r}
+                  monitor={monitors.find((m) => m.phone === r.phone)}
+                  onToggle={() => toggleRuleEnabled(r)}
+                  onEdit={() => openEditRule(r)}
+                  onDelete={() => deleteRule(r.id)}
+                />
+              ))}
+            </ul>
+          )}
+        </Panel>
+
         {/* Activity feed / Logs */}
         <Panel
           title="Activity Log"
@@ -1034,6 +1586,7 @@ export default function App() {
               <option value="">all events</option>
               <option value="online">online</option>
               <option value="offline">offline</option>
+              <option value="alert">alert</option>
               <option value="client_state">client_state</option>
             </select>
             {(filterPhone || filterEvent) && (
@@ -1078,6 +1631,7 @@ export default function App() {
                     const isOnline = ev.event_type === "online";
                     const isOffline = ev.event_type === "offline";
                     const isState = ev.event_type === "client_state";
+                    const isAlert = ev.event_type === "alert";
                     return (
                       <tr
                         key={ev.id}
@@ -1108,11 +1662,16 @@ export default function App() {
                               <Dot color="bg-amber-400" /> STATE
                             </span>
                           )}
-                          {!isOnline && !isOffline && !isState && (
+                          {isAlert && (
+                            <span className="inline-flex items-center gap-1.5 text-red-400">
+                              <Dot color="bg-red-500" /> ALERT
+                            </span>
+                          )}
+                          {!isOnline && !isOffline && !isState && !isAlert && (
                             <span className="text-zinc-500">{ev.event_type}</span>
                           )}
                         </td>
-                        <td className="py-2 pr-4 text-zinc-500">
+                        <td className={`py-2 pr-4 ${isAlert ? "text-red-300" : "text-zinc-500"}`}>
                           {ev.detail || (isState ? "client" : "—")}
                         </td>
                       </tr>
