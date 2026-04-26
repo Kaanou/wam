@@ -42,6 +42,19 @@
 - **Validation**: `email_enabled=true` now requires `email_recipient`; `daily_summary_hour` clamped to 0-23.
 - 28/28 backend tests passing.
 
+## Implemented (2026-04-26 — iteration 3)
+- **Customizable alert rules** with 3 types:
+  - `forbidden_online` : alerte si online dans la plage choisie
+  - `expected_online` : alerte si offline > grace_minutes pendant la plage choisie
+  - `inactivity` : alerte si aucun online depuis ≥ max_silence_hours (24/7)
+- Endpoints : `GET/POST/PATCH/DELETE /api/alert-rules`. Schema : phone, name, type, enabled, days_of_week (0=Mon..6=Sun), start_hour, end_hour, grace_minutes, max_silence_hours.
+- **Background evaluator** : `alert_evaluator_loop` tourne chaque 60 s ; cooldown 1 h entre 2 déclenchements de la même règle (`ALERT_COOLDOWN_SECONDS`).
+- **Trigger action** : insertion d'event `event_type="alert"` dans MongoDB, broadcast WS `{type:"alert"}`, email Resend si configuré (réutilise email_enabled / email_recipient).
+- **UI** : nouveau panneau "Alert Rules" sous Monitors. Formulaire avec sélecteur numéro, type (3 cartes), jours de la semaine (toggle), plage horaire UTC, tolérance, silence max, switch enabled. Liste des règles avec dernier déclenchement, toggle on/off, edit, delete. Notifications navigateur + toast lors d'un déclenchement.
+- **Validation PATCH** : clamping start_hour/end_hour/grace_minutes/max_silence_hours sur PATCH (pas seulement POST). Refus du nom vide.
+- **Midnight-wrap windows** : `expected_online` gère correctement les plages qui passent minuit (e.g. 22h → 6h).
+- 49/49 backend tests passing (21 nouveaux + 28 régression).
+
 ## Backlog (P1)
 - Shared-secret auth on `/api/internal/event` (currently exposed via ingress)
 - Verify a custom domain in Resend so emails can go to any recipient (mode test = vérifié seulement)

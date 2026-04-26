@@ -456,12 +456,15 @@ async def _evaluate_rule(rule: dict, monitor: Optional[dict], now: datetime) -> 
             return None
         if monitor.get("status") == "online":
             return None
+        # Window start. Handles midnight-wrap (start_hour > end_hour).
+        start_h = int(rule.get("start_hour", 0))
+        end_h = int(rule.get("end_hour", 24))
+        window_start = now.replace(hour=start_h, minute=0, second=0, microsecond=0)
+        if start_h > end_h and now.hour < end_h:
+            # We are in the early-morning tail of a window that started yesterday.
+            window_start -= timedelta(days=1)
         # Find when the contact was last online
-        last_online = await _last_online_event_ts(phone)
-        # Reference start = max(last_online, today's window start)
-        window_start = now.replace(
-            hour=int(rule.get("start_hour", 0)), minute=0, second=0, microsecond=0
-        )
+        last_online = await _last_online_event_ts(rule.get("phone", ""))
         ref = window_start
         if last_online and last_online > ref:
             ref = last_online
@@ -857,10 +860,20 @@ async def create_alert_rule(payload: AlertRuleCreate):
 @api_router.patch("/alert-rules/{rule_id}", response_model=AlertRule)
 async def patch_alert_rule(rule_id: str, payload: AlertRulePatch):
     update: dict = {}
-    for field in ("name", "enabled", "start_hour", "end_hour", "grace_minutes", "max_silence_hours"):
-        v = getattr(payload, field)
-        if v is not None:
-            update[field] = v
+    if payload.name is not None:
+        if not payload.name.strip():
+            raise HTTPException(status_code=400, detail="name cannot be empty")
+        update["name"] = payload.name.strip()
+    if payload.enabled is not None:
+        update["enabled"] = payload.enabled
+    if payload.start_hour is not None:
+        update["start_hour"] = max(0, min(23, int(payload.start_hour)))
+    if payload.end_hour is not None:
+        update["end_hour"] = max(0, min(24, int(payload.end_hour)))
+    if payload.grace_minutes is not None:
+        update["grace_minutes"] = max(1, int(payload.grace_minutes))
+    if payload.max_silence_hours is not None:
+        update["max_silence_hours"] = max(1, int(payload.max_silence_hours))
     if payload.days_of_week is not None:
         update["days_of_week"] = sorted({int(d) for d in payload.days_of_week if 0 <= int(d) <= 6})
     if not update:
