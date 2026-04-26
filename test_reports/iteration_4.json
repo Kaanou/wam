@@ -1,0 +1,46 @@
+{
+  "summary": "Backend testing complete for iteration 4 (extended surveillance: composing/recording detection, last_seen tracking, profile snapshots, analytics endpoints, backup/restore). 25/25 new iteration-4 tests passed. Combined suite: 73/74 (one prior-iteration test, test_add_monitor_when_client_not_ready_returns_409, is order-flaky — passes in isolation, not iteration-4 related). Coverage: regression smoke (status, monitors, events, settings, alert-rules), internal webhook secret enforcement (missing/wrong header -> 401), activity webhook (composing/recording inserts event with proper event_type), last_seen_update updates monitors.last_seen_public, profile_snapshot first=true inserts into db.profile_snapshots without event log, profile_change inserts snapshot AND event with event_type=profile_change and detail listing changed keys, GET /api/profile-snapshots sorted desc by captured_at, heatmap returns 7x24 grid with sum equal to total_minutes (verified 30+15=45 min sessions), heatmap days clamped 1-180, anomalies returns insufficient history note, correlations returns 'need at least 2 monitors' when <2, correlations with 2 monitors and overlapping sessions returns expected 15-minute overlap with labels, backup returns proper shape (version/exported_at/monitors/events/settings/alert_rules/profile_snapshots), restore replace=true wipes & restores, restore replace=false appends, round-trip export->restore preserves data, event_type filter works for composing/recording/profile_change.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/internal/event (last_seen_update)", "issue": "When phone is not in db.monitors, the update_one is silent (matched_count=0) — no 404 returned. Acceptable for an internal webhook but consider logging."},
+      {"endpoint": "POST /api/internal/event (profile_snapshot)", "issue": "No de-duplication: rapidly repeated identical first-snapshot calls create multiple 'first=true' rows in db.profile_snapshots. Should the Node sidecar also send first=true only once per phone? Worth documenting."},
+      {"endpoint": "GET /api/analytics/anomalies", "issue": "Hardcoded thresholds (z>=2 AND |delta|>5 minutes) are not exposed as query params or env vars; cannot tune per-user. Also days_baseline is clamped 7-120 but the docstring states 28."},
+      {"endpoint": "POST /api/backup/restore", "issue": "No schema/version compatibility check beyond the Pydantic model. A v2 backup uploaded against a server expecting v1 would silently strip unknown fields. Consider rejecting if payload.version != 1."},
+      {"endpoint": "POST /api/backup/restore", "issue": "When replace=false, no de-duplication on inserted documents — same monitor phone or same event id can be inserted twice (no unique index on db.monitors.phone or db.events.id). This will lead to duplicates if a user restores the same backup twice without replace=true."},
+      {"endpoint": "GET /api/analytics/heatmap & /correlations", "issue": "Both pair online->offline events naively; an unmatched 'online' (no offline before now) is treated as still-online until now. Acceptable but should be documented; if the offline event is missed (Node sidecar restart), this can balloon online_minutes."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iter4_features.py",
+    "/app/test_reports/pytest/iter4_features.xml",
+    "/app/test_reports/pytest/iter4_full.xml"
+  ],
+  "action_items": [
+    "Optional: add a `version` mismatch guard in POST /api/backup/restore so v!=1 returns 400.",
+    "Optional: enforce uniqueness constraints (or upsert by id) in /api/backup/restore replace=false to prevent duplicates on double-restore.",
+    "Optional: expose anomaly thresholds (z and minutes_delta) as query params; align docstring (says 28, code clamps to 7-120).",
+    "Carryover: server.py is now ~1416 lines — split into routers/ (alert_rules, analytics, backup, internal_webhook) + services/ + models.py."
+  ],
+  "critical_code_review_comments": [
+    "server.py grew from ~990 (iter3) to 1416 lines after iter4 — strongly consider splitting into routers/services modules (analytics.py, backup.py, internal_webhook.py).",
+    "_accumulate_grid uses cur.weekday()/cur.hour at the START of each minute chunk — correct because chunks never cross hour boundaries (next_hour rounding), but worth a unit-level comment.",
+    "_intervals_overlap assumes both lists are sorted by start time. analytics_correlations builds them in chronological order from sorted events, so OK — but a `sessions.sort(key=lambda s:s[0])` defensive sort would prevent regressions if an unmatched online is appended out of order.",
+    "BackupPayload accepts arbitrary dicts for monitors/events/etc with no schema validation — a malformed export (missing required fields like added_at) will be inserted and break later GET /api/monitors which calls Monitor(**d). Consider validating each item or wrapping insert_many in try/except per-batch.",
+    "POST /api/backup/restore replace=true wipes BEFORE inserting; if the insert_many fails partway, the DB ends up in a partially-restored state. A staging collection + atomic rename would be safer.",
+    "Profile snapshot endpoint stores raw pic_url — no size/hash check. If pic_url changes only because of CDN signing (URL changes but the pixels don't), the diff in whatsapp-service may emit spurious profile_change events. Consider hashing image bytes server-side or trusting only name/about diffs.",
+    "Anomaly detection uses population variance (var = sum/(n)) not sample variance (n-1). With small baseline_days, this slightly underestimates std; combined with a fixed z>=2 threshold, this skews toward false positives at low n. Consider sample variance + a minimum n>=5.",
+    "Correlations: overlap_pct uses min(total_a, total_b) as denominator — if one phone is barely online (1 minute) and overlaps perfectly, pct = 100% even though absolute overlap is tiny. The current sort by overlap_minutes mitigates this in the UI, but pct alone is misleading."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter4_features.py (new, 25 tests)"
+  ],
+  "success_rate": {"backend": "100% (25/25 new iter4 tests). Combined: 73/74 — the one failure (test_add_monitor_when_client_not_ready_returns_409) is order-flaky from prior iterations; passes in isolation.", "frontend": "not tested (backend-only request)"},
+  "test_credentials": "INTERNAL_API_SECRET=wa-mon-3f9c1a8b6d2e4f7a8c1b9d3e5f6a2b4c read from /app/backend/.env",
+  "seed_data_creation": "Tests seed data via motor: TEST_PHONE_A=33699887701, TEST_PHONE_B=33699887702, TEST_PHONE_C=33699887703. Pre/post each test the cleanup fixture deletes all events/monitors/profile_snapshots for these phones. The round-trip backup test exports the entire DB, runs replace=true with the same payload, then re-exports and compares monitor phone sets — does not destructively modify other data.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 4 added: profile_snapshots collection, internal webhook types {activity, last_seen_update, profile_snapshot, profile_change}, GET /api/profile-snapshots, GET /api/analytics/{heatmap,anomalies,correlations}, GET /api/backup, POST /api/backup/restore, BackupPayload model, helpers _accumulate_grid/_split_by_day/_intervals_overlap. To exercise heatmap/correlations seed pairs of (online, offline) events directly via motor with known timestamps. The whatsapp_service Node sidecar was NOT exercised — only the FastAPI internal webhook surface was tested via direct POST. The WS broadcasts emitted by the new types (activity/last_seen_update/profile_snapshot/profile_change/backup_restored) were not asserted but the code paths are exercised. PWA static files (/manifest.json, /sw.js) were skipped per request — they are served by the frontend dev server, not the /api router.",
+  "rca of the issue": "n/a — no failures in iter4 features. The single failing test in the combined run (test_add_monitor_when_client_not_ready_returns_409) is order-flaky from iter1 and passes in isolation; root cause is shared whatsapp-service state mutated by prior tests in the same module — not iteration 4 related."
+}

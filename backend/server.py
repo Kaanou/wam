@@ -153,13 +153,32 @@ class AlertRulePatch(BaseModel):
 
 
 class InternalEvent(BaseModel):
-    type: str  # presence | client_state
+    type: str  # presence | client_state | activity | last_seen_update | profile_snapshot | profile_change
     phone: Optional[str] = None
     status: Optional[str] = None
     state: Optional[str] = None
     timestamp: Optional[str] = None
     message: Optional[str] = None
     reason: Optional[str] = None
+    # activity (composing/recording)
+    activity: Optional[str] = None
+    # last_seen_update
+    last_seen_public: Optional[str] = None
+    # profile_snapshot / profile_change
+    pic_url: Optional[str] = None
+    name: Optional[str] = None
+    about: Optional[str] = None
+    changes: Optional[dict] = None
+    first: Optional[bool] = None
+
+
+class BackupPayload(BaseModel):
+    monitors: List[dict] = Field(default_factory=list)
+    events: List[dict] = Field(default_factory=list)
+    settings: Optional[dict] = None
+    alert_rules: List[dict] = Field(default_factory=list)
+    profile_snapshots: List[dict] = Field(default_factory=list)
+    version: int = 1
 
 
 # ---- WebSocket manager ------------------------------------------------------
@@ -911,6 +930,305 @@ async def delete_alert_rule(rule_id: str):
     return {"ok": True}
 
 
+# ---- Profile snapshots ------------------------------------------------------
+@api_router.get("/profile-snapshots")
+async def list_profile_snapshots(phone: str, limit: int = 100):
+    phone = "".join(ch for ch in phone if ch.isdigit())
+    docs = (
+        await db.profile_snapshots.find({"phone": phone}, {"_id": 0})
+        .sort("captured_at", -1)
+        .to_list(limit)
+    )
+    return docs
+
+
+# ---- Analytics --------------------------------------------------------------
+@api_router.get("/analytics/heatmap")
+async def analytics_heatmap(phone: str, days: int = 28):
+    """Return a 7x24 grid (day_of_week × hour, UTC) of online minutes summed
+    over the last `days` days, computed by pairing online→offline events."""
+    phone = "".join(ch for ch in phone if ch.isdigit())
+    days = max(1, min(180, days))
+    since = now_utc() - timedelta(days=days)
+    docs = (
+        await db.events.find(
+            {
+                "phone": phone,
+                "event_type": {"$in": ["online", "offline"]},
+                "timestamp": {"$gte": iso(since)},
+            },
+            {"_id": 0},
+        )
+        .sort("timestamp", 1)
+        .to_list(20000)
+    )
+    grid = [[0.0 for _ in range(24)] for _ in range(7)]
+    online_start: Optional[datetime] = None
+    for d in docs:
+        ts = d["timestamp"]
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
+        if d["event_type"] == "online" and online_start is None:
+            online_start = ts
+        elif d["event_type"] == "offline" and online_start is not None:
+            _accumulate_grid(grid, online_start, ts)
+            online_start = None
+    if online_start is not None:
+        _accumulate_grid(grid, online_start, now_utc())
+    total = sum(sum(r) for r in grid)
+    return {"phone": phone, "days": days, "grid": grid, "total_minutes": total}
+
+
+def _accumulate_grid(grid: list, start: datetime, end: datetime) -> None:
+    """Distribute the [start, end] interval across the 7×24 grid in minutes."""
+    if end <= start:
+        return
+    cur = start
+    while cur < end:
+        next_hour = (cur + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        chunk_end = min(end, next_hour)
+        minutes = (chunk_end - cur).total_seconds() / 60.0
+        grid[cur.weekday()][cur.hour] += minutes
+        cur = chunk_end
+
+
+@api_router.get("/analytics/anomalies")
+async def analytics_anomalies(phone: str, days_baseline: int = 28):
+    """Detect anomalies by comparing the last 24 h activity with the baseline
+    distribution per (day_of_week, hour) over the previous `days_baseline` days.
+    Returns hours where the contact deviates significantly from their pattern.
+    """
+    phone = "".join(ch for ch in phone if ch.isdigit())
+    days_baseline = max(7, min(120, days_baseline))
+    now = now_utc()
+    since = now - timedelta(days=days_baseline + 1)
+    docs = (
+        await db.events.find(
+            {
+                "phone": phone,
+                "event_type": {"$in": ["online", "offline"]},
+                "timestamp": {"$gte": iso(since)},
+            },
+            {"_id": 0},
+        )
+        .sort("timestamp", 1)
+        .to_list(20000)
+    )
+    # Build a per-day, per-(weekday, hour) minute matrix.
+    by_day: dict = {}  # date_iso -> 7x24 grid
+    online_start: Optional[datetime] = None
+    for d in docs:
+        ts = d["timestamp"]
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
+        if d["event_type"] == "online" and online_start is None:
+            online_start = ts
+        elif d["event_type"] == "offline" and online_start is not None:
+            _split_by_day(by_day, online_start, ts)
+            online_start = None
+    if online_start is not None:
+        _split_by_day(by_day, online_start, now)
+
+    # Baseline = mean & std across days (excluding current day)
+    today = now.date().isoformat()
+    baseline_days = [g for k, g in by_day.items() if k != today]
+    if len(baseline_days) < 3:
+        return {"phone": phone, "anomalies": [], "note": "insufficient history"}
+    today_grid = by_day.get(today)
+    if today_grid is None:
+        return {"phone": phone, "anomalies": [], "note": "no data today"}
+    anomalies = []
+    for dow in range(7):
+        for h in range(24):
+            samples = [g[dow][h] for g in baseline_days if g[dow][h] > 0]
+            if len(samples) < 2:
+                continue
+            mean = sum(samples) / len(samples)
+            var = sum((x - mean) ** 2 for x in samples) / len(samples)
+            std = var ** 0.5
+            today_val = today_grid[dow][h]
+            if dow != now.weekday():
+                continue
+            if std == 0 and today_val == 0:
+                continue
+            z = (today_val - mean) / std if std > 0 else 0
+            if abs(z) >= 2 and abs(today_val - mean) > 5:
+                anomalies.append(
+                    {
+                        "weekday": dow,
+                        "hour": h,
+                        "today_minutes": round(today_val, 1),
+                        "baseline_mean_minutes": round(mean, 1),
+                        "z_score": round(z, 2),
+                        "kind": "more_active" if z > 0 else "less_active",
+                    }
+                )
+    return {"phone": phone, "anomalies": anomalies}
+
+
+def _split_by_day(by_day: dict, start: datetime, end: datetime) -> None:
+    cur = start
+    while cur < end:
+        day_end = (cur + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        chunk_end = min(end, day_end)
+        day_key = cur.date().isoformat()
+        if day_key not in by_day:
+            by_day[day_key] = [[0.0 for _ in range(24)] for _ in range(7)]
+        # Within a single hour anyway, but reuse accumulation logic
+        c = cur
+        while c < chunk_end:
+            next_hour = (c + timedelta(hours=1)).replace(
+                minute=0, second=0, microsecond=0
+            )
+            ce = min(chunk_end, next_hour)
+            minutes = (ce - c).total_seconds() / 60.0
+            by_day[day_key][c.weekday()][c.hour] += minutes
+            c = ce
+        cur = chunk_end
+
+
+@api_router.get("/analytics/correlations")
+async def analytics_correlations(days: int = 14, top: int = 20):
+    """For each pair of monitored phones, compute the % of overlap between
+    their online sessions. Returns the top N pairs sorted by overlap minutes.
+    """
+    days = max(1, min(60, days))
+    since = now_utc() - timedelta(days=days)
+    monitors = await db.monitors.find({}, {"_id": 0}).to_list(500)
+    phones = [m["phone"] for m in monitors]
+    if len(phones) < 2:
+        return {"days": days, "pairs": [], "note": "need at least 2 monitors"}
+
+    # Build online intervals per phone.
+    intervals: dict = {}
+    for p in phones:
+        docs = (
+            await db.events.find(
+                {
+                    "phone": p,
+                    "event_type": {"$in": ["online", "offline"]},
+                    "timestamp": {"$gte": iso(since)},
+                },
+                {"_id": 0},
+            )
+            .sort("timestamp", 1)
+            .to_list(20000)
+        )
+        sessions = []
+        start: Optional[datetime] = None
+        for d in docs:
+            ts = d["timestamp"]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts)
+            if d["event_type"] == "online" and start is None:
+                start = ts
+            elif d["event_type"] == "offline" and start is not None:
+                sessions.append((start, ts))
+                start = None
+        if start is not None:
+            sessions.append((start, now_utc()))
+        intervals[p] = sessions
+
+    pairs = []
+    for i in range(len(phones)):
+        for j in range(i + 1, len(phones)):
+            a, b = phones[i], phones[j]
+            overlap_seconds = _intervals_overlap(intervals[a], intervals[b])
+            total_a = sum((e - s).total_seconds() for s, e in intervals[a])
+            total_b = sum((e - s).total_seconds() for s, e in intervals[b])
+            if overlap_seconds == 0:
+                continue
+            pct = (
+                100 * overlap_seconds / min(total_a, total_b) if min(total_a, total_b) > 0 else 0
+            )
+            la = next((m.get("label") for m in monitors if m["phone"] == a), None)
+            lb = next((m.get("label") for m in monitors if m["phone"] == b), None)
+            pairs.append(
+                {
+                    "phone_a": a,
+                    "label_a": la,
+                    "phone_b": b,
+                    "label_b": lb,
+                    "overlap_minutes": round(overlap_seconds / 60, 1),
+                    "overlap_pct": round(pct, 1),
+                }
+            )
+    pairs.sort(key=lambda p: p["overlap_minutes"], reverse=True)
+    return {"days": days, "pairs": pairs[:top]}
+
+
+def _intervals_overlap(a_list, b_list) -> float:
+    """Sum of overlap seconds between two lists of intervals."""
+    total = 0.0
+    i = j = 0
+    while i < len(a_list) and j < len(b_list):
+        s = max(a_list[i][0], b_list[j][0])
+        e = min(a_list[i][1], b_list[j][1])
+        if e > s:
+            total += (e - s).total_seconds()
+        if a_list[i][1] < b_list[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+# ---- Backup / restore -------------------------------------------------------
+@api_router.get("/backup")
+async def backup():
+    monitors = await db.monitors.find({}, {"_id": 0}).to_list(2000)
+    events = await db.events.find({}, {"_id": 0}).to_list(50000)
+    settings = await db.settings.find_one({"_id": "global"}, {"_id": 0})
+    rules = await db.alert_rules.find({}, {"_id": 0}).to_list(500)
+    snaps = await db.profile_snapshots.find({}, {"_id": 0}).to_list(20000)
+    return {
+        "version": 1,
+        "exported_at": iso(now_utc()),
+        "monitors": monitors,
+        "events": events,
+        "settings": settings,
+        "alert_rules": rules,
+        "profile_snapshots": snaps,
+    }
+
+
+@api_router.post("/backup/restore")
+async def restore_backup(payload: BackupPayload, replace: bool = True):
+    """Restore from a backup. By default replaces all data (replace=true)."""
+    if replace:
+        await db.monitors.delete_many({})
+        await db.events.delete_many({})
+        await db.alert_rules.delete_many({})
+        await db.profile_snapshots.delete_many({})
+    if payload.monitors:
+        await db.monitors.insert_many([{**m} for m in payload.monitors])
+    if payload.events:
+        # Insert in chunks to avoid huge queries.
+        chunk = 500
+        for k in range(0, len(payload.events), chunk):
+            await db.events.insert_many([{**e} for e in payload.events[k : k + chunk]])
+    if payload.alert_rules:
+        await db.alert_rules.insert_many([{**r} for r in payload.alert_rules])
+    if payload.profile_snapshots:
+        await db.profile_snapshots.insert_many([{**s} for s in payload.profile_snapshots])
+    if payload.settings:
+        doc = {**payload.settings, "_id": "global"}
+        await db.settings.replace_one({"_id": "global"}, doc, upsert=True)
+    await ws_manager.broadcast({"type": "backup_restored"})
+    return {
+        "ok": True,
+        "restored": {
+            "monitors": len(payload.monitors),
+            "events": len(payload.events),
+            "alert_rules": len(payload.alert_rules),
+            "profile_snapshots": len(payload.profile_snapshots),
+            "settings": bool(payload.settings),
+        },
+    }
+
+
 # ---- Internal webhook auth --------------------------------------------------
 def verify_internal_secret(x_internal_secret: Optional[str]) -> None:
     if not INTERNAL_API_SECRET:
@@ -970,6 +1288,90 @@ async def internal_event(
         )
         # Fire-and-forget email
         asyncio.create_task(send_alert_email(payload.phone, payload.status, ts))
+        return {"ok": True}
+
+    if payload.type == "activity" and payload.phone and payload.activity:
+        ts = (
+            datetime.fromisoformat(payload.timestamp)
+            if payload.timestamp
+            else now_utc()
+        )
+        ev_id = str(uuid.uuid4())
+        ev_doc = {
+            "id": ev_id,
+            "phone": payload.phone,
+            "event_type": payload.activity,  # composing | recording
+            "timestamp": iso(ts),
+            "detail": None,
+        }
+        await db.events.insert_one(ev_doc.copy())
+        await ws_manager.broadcast(
+            {
+                "type": "activity",
+                "phone": payload.phone,
+                "activity": payload.activity,
+                "timestamp": iso(ts),
+                "id": ev_id,
+            }
+        )
+        return {"ok": True}
+
+    if payload.type == "last_seen_update" and payload.phone and payload.last_seen_public:
+        await db.monitors.update_one(
+            {"phone": payload.phone},
+            {"$set": {"last_seen_public": payload.last_seen_public}},
+        )
+        await ws_manager.broadcast(
+            {
+                "type": "last_seen_update",
+                "phone": payload.phone,
+                "last_seen_public": payload.last_seen_public,
+            }
+        )
+        return {"ok": True}
+
+    if payload.type in ("profile_snapshot", "profile_change") and payload.phone:
+        ts = (
+            datetime.fromisoformat(payload.timestamp)
+            if payload.timestamp
+            else now_utc()
+        )
+        snap_id = str(uuid.uuid4())
+        snap_doc = {
+            "id": snap_id,
+            "phone": payload.phone,
+            "captured_at": iso(ts),
+            "pic_url": payload.pic_url,
+            "name": payload.name,
+            "about": payload.about,
+            "changes": payload.changes,
+            "first": bool(payload.first),
+        }
+        await db.profile_snapshots.insert_one(snap_doc.copy())
+        # If it's a real change (not the initial baseline), also log an event
+        if payload.type == "profile_change":
+            ev_id = str(uuid.uuid4())
+            change_keys = list((payload.changes or {}).keys())
+            detail = "profile changed: " + ", ".join(change_keys) if change_keys else "profile changed"
+            ev_doc = {
+                "id": ev_id,
+                "phone": payload.phone,
+                "event_type": "profile_change",
+                "timestamp": iso(ts),
+                "detail": detail,
+            }
+            await db.events.insert_one(ev_doc.copy())
+            await ws_manager.broadcast(
+                {
+                    "type": "profile_change",
+                    "phone": payload.phone,
+                    "changes": payload.changes,
+                    "timestamp": iso(ts),
+                    "id": ev_id,
+                }
+            )
+        else:
+            await ws_manager.broadcast({"type": "profile_snapshot", "phone": payload.phone})
         return {"ok": True}
 
     return {"ok": True, "ignored": True}

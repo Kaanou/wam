@@ -118,23 +118,63 @@ client.on("presence_update", async (presence) => {
     const phone = jidToPhone(id);
     if (!monitored.has(phone)) return;
 
-    // chatstates is an array { state: "available"|"unavailable"|"composing"|... }
+    // chatstates is an array { state: "available"|"unavailable"|"composing"|"recording"|... }
     let isOnline = null;
+    let composingState = null; // "composing" | "recording" | null
     if (Array.isArray(presence.chatstates)) {
-      const me = presence.chatstates.find((c) => c.id?._serialized === id) || presence.chatstates[0];
+      const me =
+        presence.chatstates.find((c) => c.id?._serialized === id) ||
+        presence.chatstates[0];
       if (me) {
-        if (me.type === "available" || me.state === "available") isOnline = true;
-        else if (me.type === "unavailable" || me.state === "unavailable") isOnline = false;
+        const s = me.type || me.state;
+        if (s === "available") isOnline = true;
+        else if (s === "unavailable") isOnline = false;
+        else if (s === "composing" || s === "recording") {
+          isOnline = true; // typing/recording implies online
+          composingState = s;
+        }
       }
     }
     if (isOnline === null && presence.isOnline !== undefined) isOnline = !!presence.isOnline;
-    if (isOnline === null) return;
 
     const entry = monitored.get(phone);
+    const nowIso = new Date().toISOString();
+
+    // Capture last_seen if WhatsApp publishes it.
+    if (presence.lastSeen) {
+      const lsIso = new Date(presence.lastSeen * 1000).toISOString();
+      if (entry.lastSeenPublic !== lsIso) {
+        entry.lastSeenPublic = lsIso;
+        postEvent({
+          type: "last_seen_update",
+          phone,
+          last_seen_public: lsIso,
+          timestamp: nowIso,
+        });
+      }
+    }
+
+    if (composingState && entry.composing !== composingState) {
+      entry.composing = composingState;
+      postEvent({
+        type: "activity",
+        phone,
+        activity: composingState, // "composing" | "recording"
+        timestamp: nowIso,
+      });
+      // Reset composing state after 8 s of no further updates so the next
+      // composing event re-fires.
+      clearTimeout(entry.composingTimer);
+      entry.composingTimer = setTimeout(() => {
+        entry.composing = null;
+      }, 8000);
+    }
+
+    if (isOnline === null) return;
     const newStatus = isOnline ? "online" : "offline";
     if (entry.status !== newStatus) {
       entry.status = newStatus;
-      entry.lastSeen = new Date().toISOString();
+      entry.lastSeen = nowIso;
       monitored.set(phone, entry);
       postEvent({
         type: "presence",
@@ -174,6 +214,78 @@ async function pollPresenceLoop() {
       }
     }
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
+
+// ---- Profile polling --------------------------------------------------------
+// Every PROFILE_POLL_MS, fetch profile pic, name and about for each monitored
+// number. Compare with the last known snapshot and emit profile_change events.
+const PROFILE_POLL_MS = parseInt(process.env.PROFILE_POLL_MS || "1800000", 10); // 30 min default
+const profileSnapshots = new Map(); // phone -> { pic_url, name, about }
+
+async function pollProfilesLoop() {
+  // Initial delay so we don't poll immediately at boot.
+  await new Promise((r) => setTimeout(r, 60_000));
+  while (true) {
+    if (clientState === "ready" && monitored.size > 0) {
+      for (const [phone, entry] of monitored.entries()) {
+        try {
+          const contact = await client.getContactById(entry.jid);
+          if (!contact) continue;
+          let picUrl = null;
+          try {
+            picUrl = await contact.getProfilePicUrl();
+          } catch {
+            picUrl = null;
+          }
+          let about = null;
+          try {
+            about = await contact.getAbout();
+          } catch {
+            about = null;
+          }
+          const name = contact.pushname || contact.name || null;
+
+          const prev = profileSnapshots.get(phone) || {};
+          const changes = {};
+          if (prev.pic_url !== picUrl) changes.pic_url = { from: prev.pic_url || null, to: picUrl };
+          if (prev.name !== name) changes.name = { from: prev.name || null, to: name };
+          if (prev.about !== about) changes.about = { from: prev.about || null, to: about };
+
+          const next = { pic_url: picUrl, name, about };
+          profileSnapshots.set(phone, next);
+
+          // First snapshot — initial baseline, don't emit events.
+          if (!prev.captured_at) {
+            postEvent({
+              type: "profile_snapshot",
+              phone,
+              pic_url: picUrl,
+              name,
+              about,
+              first: true,
+              timestamp: new Date().toISOString(),
+            });
+            next.captured_at = new Date().toISOString();
+            continue;
+          }
+          if (Object.keys(changes).length > 0) {
+            postEvent({
+              type: "profile_change",
+              phone,
+              changes,
+              pic_url: picUrl,
+              name,
+              about,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch (err) {
+          console.error(`[wa] profile poll ${phone} error:`, err.message);
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, PROFILE_POLL_MS));
   }
 }
 
@@ -365,3 +477,4 @@ client.initialize().catch((err) => {
   console.error("[wa] initialize failed:", err);
 });
 pollPresenceLoop().catch((err) => console.error("[wa] poll loop error:", err));
+pollProfilesLoop().catch((err) => console.error("[wa] profile poll loop error:", err));

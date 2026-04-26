@@ -4,21 +4,26 @@ import { Toaster, toast } from "sonner";
 import {
   Activity,
   AlertTriangle,
+  BarChart3,
   Calendar,
+  ChevronDown,
   CircleDot,
   Clock,
   Download,
   Edit3,
+  Image as ImageIcon,
   Info,
   KeyRound,
   LogOut,
   Mail,
+  Network,
   Plus,
   QrCode,
   RefreshCw,
   Send,
   Shield,
   Trash2,
+  Upload,
   Wifi,
   WifiOff,
   ScanLine,
@@ -445,6 +450,174 @@ const RuleRow = ({ rule, monitor, onToggle, onEdit, onDelete }) => {
   );
 };
 
+// ---------- Heatmap & analytics ----------
+const HM_COLORS = [
+  "bg-zinc-900/40",
+  "bg-emerald-900/40",
+  "bg-emerald-700/50",
+  "bg-emerald-600/60",
+  "bg-emerald-500/70",
+  "bg-emerald-400/90",
+];
+
+const Heatmap = ({ grid }) => {
+  if (!grid) return null;
+  const max = Math.max(1, ...grid.flat());
+  const colorOf = (v) => {
+    if (!v) return HM_COLORS[0];
+    const ratio = v / max;
+    if (ratio < 0.05) return HM_COLORS[1];
+    if (ratio < 0.2) return HM_COLORS[2];
+    if (ratio < 0.4) return HM_COLORS[3];
+    if (ratio < 0.7) return HM_COLORS[4];
+    return HM_COLORS[5];
+  };
+  return (
+    <div data-testid="heatmap" className="overflow-x-auto scroll-thin">
+      <table className="border-separate border-spacing-[2px]">
+        <thead>
+          <tr>
+            <th></th>
+            {Array.from({ length: 24 }).map((_, h) => (
+              <th
+                key={h}
+                className="text-[9px] font-mono text-zinc-600 px-0.5 align-bottom"
+              >
+                {h % 3 === 0 ? String(h).padStart(2, "0") : ""}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {DAY_LABELS.map((lab, dow) => (
+            <tr key={dow}>
+              <td className="text-[10px] font-mono text-zinc-500 pr-2">{lab}</td>
+              {grid[dow].map((v, h) => (
+                <td
+                  key={h}
+                  title={`${lab} ${String(h).padStart(2, "0")}:00 — ${Math.round(v)} min`}
+                  className={`h-5 w-5 rounded-[2px] ${colorOf(v)}`}
+                ></td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="flex items-center gap-1 mt-2 text-[9px] font-mono text-zinc-600">
+        <span>moins</span>
+        {HM_COLORS.map((c, i) => (
+          <span key={i} className={`h-3 w-3 rounded-[2px] ${c}`}></span>
+        ))}
+        <span>plus actif</span>
+        <span className="ml-auto">total · {Math.round(grid.flat().reduce((a, b) => a + b, 0))} min</span>
+      </div>
+    </div>
+  );
+};
+
+const MonitorDetail = ({ phone, heatmap, anomalies, snapshots, loading }) => {
+  if (loading) {
+    return (
+      <div className="text-[11px] font-mono text-zinc-500 py-4">chargement...</div>
+    );
+  }
+  return (
+    <div className="space-y-5 mt-3 pt-3 border-t border-zinc-800">
+      <div>
+        <h4 className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-2">
+          Heatmap d'activité · 28 jours · UTC
+        </h4>
+        {heatmap?.grid ? (
+          <Heatmap grid={heatmap.grid} />
+        ) : (
+          <div className="text-[11px] font-mono text-zinc-600">pas de données</div>
+        )}
+      </div>
+      <div>
+        <h4 className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-2">
+          Anomalies aujourd'hui
+        </h4>
+        {anomalies?.note ? (
+          <div className="text-[11px] font-mono text-zinc-600">{anomalies.note}</div>
+        ) : anomalies?.anomalies?.length ? (
+          <ul className="space-y-1.5">
+            {anomalies.anomalies.map((a, i) => (
+              <li
+                key={i}
+                className="text-[11px] font-mono text-zinc-300 flex items-center gap-2"
+              >
+                <AlertTriangle
+                  size={11}
+                  strokeWidth={1.75}
+                  className={a.kind === "more_active" ? "text-amber-400" : "text-cyan-400"}
+                />
+                <span>
+                  {DAY_LABELS[a.weekday]} {String(a.hour).padStart(2, "0")}h ·{" "}
+                  <span className="text-zinc-100">
+                    {a.today_minutes} min
+                  </span>
+                  <span className="text-zinc-500"> vs. baseline {a.baseline_mean_minutes} min</span>
+                  <span className={`ml-2 px-1.5 py-0.5 rounded-sm border text-[10px] ${a.kind === "more_active" ? "border-amber-500/30 text-amber-300 bg-amber-500/5" : "border-cyan-500/30 text-cyan-300 bg-cyan-500/5"}`}>
+                    {a.kind === "more_active" ? "+ actif" : "− actif"} · z={a.z_score}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="text-[11px] font-mono text-zinc-600">aucune anomalie détectée</div>
+        )}
+      </div>
+      <div>
+        <h4 className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500 mb-2">
+          Timeline du profil
+        </h4>
+        {snapshots?.length ? (
+          <ul className="space-y-2">
+            {snapshots.map((s) => (
+              <li
+                key={s.id}
+                className="flex items-start gap-3 border border-zinc-800 rounded-sm p-2 bg-zinc-950/40"
+              >
+                {s.pic_url ? (
+                  <img
+                    src={s.pic_url}
+                    alt="profil"
+                    className="w-12 h-12 rounded-sm object-cover border border-zinc-800"
+                    onError={(e) => {
+                      e.currentTarget.style.display = "none";
+                    }}
+                  />
+                ) : (
+                  <div className="w-12 h-12 rounded-sm border border-dashed border-zinc-800 flex items-center justify-center text-zinc-700 text-[10px]">
+                    no pic
+                  </div>
+                )}
+                <div className="flex-1 min-w-0 text-[11px] font-mono">
+                  <div className="text-zinc-300">
+                    {s.name || <span className="text-zinc-600 italic">no name</span>}
+                  </div>
+                  <div className="text-zinc-500 truncate">
+                    {s.about || <span className="italic">no about</span>}
+                  </div>
+                  <div className="text-zinc-600 mt-0.5">
+                    {s.first ? "• baseline · " : "• change · "}
+                    {fmtTime(s.captured_at)}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="text-[11px] font-mono text-zinc-600">
+            aucun snapshot · le polling profil démarre 1 min après l'ajout d'un monitor (puis toutes les 30 min)
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 // ---------- main ----------
 export default function App() {
   const [waState, setWaState] = useState({ state: "initializing", me: null });
@@ -490,6 +663,21 @@ export default function App() {
   };
   const [ruleForm, setRuleForm] = useState(emptyRuleForm);
   const [savingRule, setSavingRule] = useState(false);
+
+  // Monitor expand / detail (heatmap, anomalies, profile timeline)
+  const [expandedPhone, setExpandedPhone] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailHeatmap, setDetailHeatmap] = useState(null);
+  const [detailAnomalies, setDetailAnomalies] = useState(null);
+  const [detailSnapshots, setDetailSnapshots] = useState([]);
+
+  // Correlations
+  const [correlations, setCorrelations] = useState([]);
+  const [correlationsLoading, setCorrelationsLoading] = useState(false);
+
+  // Backup
+  const [restoring, setRestoring] = useState(false);
+  const fileInputRef = useRef(null);
 
   const wsRef = useRef(null);
   const liveFlashRef = useRef(new Set());
@@ -647,6 +835,42 @@ export default function App() {
       } else if (data.state === "disconnected") {
         toast.error("WhatsApp déconnecté");
       }
+    } else if (data.type === "activity") {
+      // composing | recording — short-lived signal, just toast + log
+      const { phone, activity, timestamp, id } = data;
+      const matches =
+        (!filterPhone.trim() || phone.includes(filterPhone.replace(/[^0-9]/g, ""))) &&
+        (!filterEvent || filterEvent === activity);
+      if (matches) {
+        setEvents((prev) =>
+          [{ id, phone, event_type: activity, timestamp, detail: null }, ...prev].slice(0, 500),
+        );
+        liveFlashRef.current.add(id);
+        setTimeout(() => liveFlashRef.current.delete(id), 2000);
+      }
+      const verb = activity === "composing" ? "✏ tape un message" : "🎤 enregistre un audio";
+      toast(`+${phone} ${verb}`, { description: fmtTime(timestamp) });
+    } else if (data.type === "last_seen_update") {
+      setMonitors((prev) =>
+        prev.map((m) =>
+          m.phone === data.phone ? { ...m, last_seen_public: data.last_seen_public } : m,
+        ),
+      );
+    } else if (data.type === "profile_change") {
+      const { phone, changes, timestamp, id } = data;
+      const fields = Object.keys(changes || {}).join(", ");
+      const matches =
+        (!filterPhone.trim() || phone.includes(filterPhone.replace(/[^0-9]/g, ""))) &&
+        (!filterEvent || filterEvent === "profile_change");
+      if (matches) {
+        setEvents((prev) =>
+          [
+            { id, phone, event_type: "profile_change", timestamp, detail: `profile changed: ${fields}` },
+            ...prev,
+          ].slice(0, 500),
+        );
+      }
+      toast(`+${phone} a changé son profil`, { description: fields });
     } else if (data.type === "alert") {
       const { phone, message, rule_name, timestamp, id } = data;
       // Refetch rules to pick up updated last_triggered_at
@@ -960,6 +1184,97 @@ export default function App() {
       toast("Alerte supprimée");
     } catch {
       toast.error("Erreur lors de la suppression");
+    }
+  };
+
+  // ---------- Monitor detail (heatmap / anomalies / timeline) ----------
+  const toggleMonitorDetail = async (phone) => {
+    if (expandedPhone === phone) {
+      setExpandedPhone(null);
+      return;
+    }
+    setExpandedPhone(phone);
+    setDetailLoading(true);
+    setDetailHeatmap(null);
+    setDetailAnomalies(null);
+    setDetailSnapshots([]);
+    try {
+      const [hm, an, sn] = await Promise.all([
+        axios.get(`${API}/analytics/heatmap?phone=${phone}&days=28`),
+        axios.get(`${API}/analytics/anomalies?phone=${phone}`),
+        axios.get(`${API}/profile-snapshots?phone=${phone}&limit=20`),
+      ]);
+      setDetailHeatmap(hm.data);
+      setDetailAnomalies(an.data);
+      setDetailSnapshots(sn.data || []);
+    } catch (err) {
+      toast.error("Impossible de charger le détail");
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  // ---------- Correlations ----------
+  const loadCorrelations = useCallback(async () => {
+    setCorrelationsLoading(true);
+    try {
+      const r = await axios.get(`${API}/analytics/correlations?days=14&top=20`);
+      setCorrelations(r.data?.pairs || []);
+    } catch {
+      /* ignore */
+    } finally {
+      setCorrelationsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (monitors.length >= 2) loadCorrelations();
+  }, [monitors.length, loadCorrelations]);
+
+  // ---------- Backup / restore ----------
+  const exportBackup = async () => {
+    try {
+      const r = await axios.get(`${API}/backup`);
+      const blob = new Blob([JSON.stringify(r.data, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `wa-monitor-backup-${new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Backup téléchargé");
+    } catch {
+      toast.error("Erreur lors de l'export");
+    }
+  };
+
+  const importBackup = async (file) => {
+    if (!file) return;
+    if (
+      !window.confirm(
+        "Restaurer ce backup va REMPLACER toutes les données actuelles. Continuer ?",
+      )
+    )
+      return;
+    setRestoring(true);
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const r = await axios.post(`${API}/backup/restore?replace=true`, data);
+      const restored = r.data?.restored || {};
+      toast.success(
+        `Restauré · ${restored.monitors || 0} monitors · ${restored.events || 0} events · ${restored.alert_rules || 0} alerts`,
+      );
+      await fetchAll();
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err?.message || "Erreur";
+      toast.error(`Restauration échouée : ${typeof detail === "string" ? detail : JSON.stringify(detail)}`);
+    } finally {
+      setRestoring(false);
     }
   };
 
@@ -1449,6 +1764,42 @@ export default function App() {
                   , puis remplacez <span className="text-zinc-300">SENDER_EMAIL</span> dans le .env backend.
                 </p>
               </div>
+
+              <div className="border border-zinc-800 rounded-sm p-3 space-y-3">
+                <div className="text-[10px] font-mono uppercase tracking-[0.22em] text-zinc-500">
+                  Backup · Restauration
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    data-testid="export-backup-button"
+                    onClick={exportBackup}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2 border border-zinc-700 hover:bg-zinc-800 hover:text-white text-zinc-300 rounded-sm font-mono text-[11px] uppercase tracking-[0.18em] transition-colors"
+                  >
+                    <Download size={12} strokeWidth={1.75} /> Export JSON
+                  </button>
+                  <button
+                    data-testid="import-backup-button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={restoring}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2 border border-zinc-700 hover:bg-zinc-800 hover:text-white text-zinc-300 disabled:opacity-50 rounded-sm font-mono text-[11px] uppercase tracking-[0.18em] transition-colors"
+                  >
+                    <Upload size={12} strokeWidth={1.75} />
+                    {restoring ? "Restauration..." : "Restore"}
+                  </button>
+                  <input
+                    ref={fileInputRef}
+                    data-testid="import-backup-file"
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={(e) => importBackup(e.target.files?.[0])}
+                    className="hidden"
+                  />
+                </div>
+                <p className="text-[10px] font-mono text-zinc-600 leading-relaxed">
+                  ⓘ Export contient monitors, événements, alertes, snapshots de profil et settings.
+                  Restore remplace tout.
+                </p>
+              </div>
             </div>
           </Panel>
         </div>
@@ -1478,82 +1829,176 @@ export default function App() {
                 <li
                   key={m.phone}
                   data-testid={`monitor-row-${m.phone}`}
-                  className="flex items-center justify-between py-3 gap-4 hover:bg-zinc-900/40 -mx-4 px-4 transition-colors"
+                  className="py-3 -mx-4 px-4 hover:bg-zinc-900/40 transition-colors"
                 >
-                  <div className="flex items-center gap-4 min-w-0 flex-1">
-                    <StatusPill status={m.status || "unknown"} />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <div className="font-mono text-sm text-zinc-100 truncate">
-                          +{m.phone}
-                        </div>
-                        {editingLabel === m.phone ? (
-                          <div className="flex items-center gap-1 flex-1 max-w-xs">
-                            <input
-                              data-testid={`label-edit-input-${m.phone}`}
-                              value={editingLabelValue}
-                              onChange={(e) => setEditingLabelValue(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") updateLabel(m.phone);
-                                if (e.key === "Escape") setEditingLabel(null);
-                              }}
-                              autoFocus
-                              maxLength={40}
-                              className="flex-1 bg-zinc-950 border border-zinc-700 px-2 py-0.5 text-xs text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
-                              placeholder="alias..."
-                            />
-                            <button
-                              data-testid={`label-save-${m.phone}`}
-                              onClick={() => updateLabel(m.phone)}
-                              className="text-[10px] font-mono uppercase tracking-[0.18em] text-emerald-400 hover:text-emerald-300 px-1"
-                            >
-                              ok
-                            </button>
-                            <button
-                              onClick={() => setEditingLabel(null)}
-                              className="text-zinc-500 hover:text-zinc-300"
-                            >
-                              <X size={12} strokeWidth={1.75} />
-                            </button>
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-4 min-w-0 flex-1">
+                      <StatusPill status={m.status || "unknown"} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <div className="font-mono text-sm text-zinc-100 truncate">
+                            +{m.phone}
                           </div>
-                        ) : (
-                          <button
-                            data-testid={`label-edit-${m.phone}`}
-                            onClick={() => startEditLabel(m)}
-                            className="inline-flex items-center gap-1 text-xs font-mono text-zinc-400 hover:text-zinc-100 group"
-                            title="Editer alias"
-                          >
-                            {m.label ? (
-                              <span className="px-2 py-0.5 border border-zinc-800 rounded-sm bg-zinc-900/60 text-zinc-200">
-                                {m.label}
-                              </span>
-                            ) : (
-                              <span className="text-zinc-600 italic">+ alias</span>
-                            )}
-                            <Edit3 size={11} strokeWidth={1.75} className="opacity-0 group-hover:opacity-100 transition-opacity" />
-                          </button>
-                        )}
-                      </div>
-                      <div className="text-[11px] font-mono text-zinc-500 truncate mt-0.5">
-                        {m.last_seen
-                          ? `last change · ${fmtRelative(m.last_seen)}`
-                          : "no presence event yet"}
+                          {editingLabel === m.phone ? (
+                            <div className="flex items-center gap-1 flex-1 max-w-xs">
+                              <input
+                                data-testid={`label-edit-input-${m.phone}`}
+                                value={editingLabelValue}
+                                onChange={(e) => setEditingLabelValue(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") updateLabel(m.phone);
+                                  if (e.key === "Escape") setEditingLabel(null);
+                                }}
+                                autoFocus
+                                maxLength={40}
+                                className="flex-1 bg-zinc-950 border border-zinc-700 px-2 py-0.5 text-xs text-zinc-50 font-mono focus:outline-none focus:ring-1 focus:ring-white focus:border-white rounded-sm"
+                                placeholder="alias..."
+                              />
+                              <button
+                                data-testid={`label-save-${m.phone}`}
+                                onClick={() => updateLabel(m.phone)}
+                                className="text-[10px] font-mono uppercase tracking-[0.18em] text-emerald-400 hover:text-emerald-300 px-1"
+                              >
+                                ok
+                              </button>
+                              <button
+                                onClick={() => setEditingLabel(null)}
+                                className="text-zinc-500 hover:text-zinc-300"
+                              >
+                                <X size={12} strokeWidth={1.75} />
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              data-testid={`label-edit-${m.phone}`}
+                              onClick={() => startEditLabel(m)}
+                              className="inline-flex items-center gap-1 text-xs font-mono text-zinc-400 hover:text-zinc-100 group"
+                              title="Editer alias"
+                            >
+                              {m.label ? (
+                                <span className="px-2 py-0.5 border border-zinc-800 rounded-sm bg-zinc-900/60 text-zinc-200">
+                                  {m.label}
+                                </span>
+                              ) : (
+                                <span className="text-zinc-600 italic">+ alias</span>
+                              )}
+                              <Edit3 size={11} strokeWidth={1.75} className="opacity-0 group-hover:opacity-100 transition-opacity" />
+                            </button>
+                          )}
+                        </div>
+                        <div className="text-[11px] font-mono text-zinc-500 truncate mt-0.5">
+                          {m.last_seen
+                            ? `last change · ${fmtRelative(m.last_seen)}`
+                            : "no presence event yet"}
+                          {m.last_seen_public && (
+                            <span className="ml-2 text-cyan-400/80">
+                              · vu à · {fmtRelative(m.last_seen_public)}
+                            </span>
+                          )}
+                        </div>
                       </div>
                     </div>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        data-testid={`expand-monitor-${m.phone}`}
+                        onClick={() => toggleMonitorDetail(m.phone)}
+                        className={`p-2 border rounded-sm transition-colors ${
+                          expandedPhone === m.phone
+                            ? "border-emerald-500/40 text-emerald-400 bg-emerald-500/5"
+                            : "border-zinc-800 hover:border-zinc-600 text-zinc-500 hover:text-zinc-100"
+                        }`}
+                        title="Voir analytics & timeline"
+                      >
+                        <BarChart3 size={14} strokeWidth={1.75} />
+                      </button>
+                      <button
+                        data-testid={`remove-monitor-${m.phone}`}
+                        onClick={() => removeMonitor(m.phone)}
+                        className="p-2 border border-zinc-800 hover:border-red-500/30 hover:bg-red-500/10 text-zinc-500 hover:text-red-400 rounded-sm transition-colors"
+                        title="Remove"
+                      >
+                        <Trash2 size={14} strokeWidth={1.75} />
+                      </button>
+                    </div>
                   </div>
-                  <button
-                    data-testid={`remove-monitor-${m.phone}`}
-                    onClick={() => removeMonitor(m.phone)}
-                    className="p-2 border border-zinc-800 hover:border-red-500/30 hover:bg-red-500/10 text-zinc-500 hover:text-red-400 rounded-sm transition-colors"
-                    title="Remove"
-                  >
-                    <Trash2 size={14} strokeWidth={1.75} />
-                  </button>
+                  {expandedPhone === m.phone && (
+                    <MonitorDetail
+                      phone={m.phone}
+                      heatmap={detailHeatmap}
+                      anomalies={detailAnomalies}
+                      snapshots={detailSnapshots}
+                      loading={detailLoading}
+                    />
+                  )}
                 </li>
               ))}
             </ul>
           )}
         </Panel>
+
+        {/* Correlations between contacts */}
+        {monitors.length >= 2 && (
+          <Panel
+            title="Correlations · co-online sessions"
+            icon={Network}
+            testid="panel-correlations"
+            right={
+              <button
+                data-testid="reload-correlations-button"
+                onClick={loadCorrelations}
+                disabled={correlationsLoading}
+                className="text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500 hover:text-zinc-200 disabled:opacity-50"
+              >
+                {correlationsLoading ? "calcul..." : "refresh"}
+              </button>
+            }
+          >
+            {correlations.length === 0 ? (
+              <div className="py-8 flex flex-col items-center gap-2 text-zinc-600">
+                <Network size={24} strokeWidth={1.25} />
+                <p className="text-sm font-mono">Pas de chevauchement détecté.</p>
+                <p className="text-[11px] font-mono text-zinc-700 max-w-md text-center">
+                  Quand au moins 2 numéros sont surveillés ET online en même temps,
+                  ils apparaîtront ici classés par minutes en commun.
+                </p>
+              </div>
+            ) : (
+              <ul className="divide-y divide-zinc-800" data-testid="correlations-list">
+                {correlations.map((p, i) => (
+                  <li
+                    key={`${p.phone_a}-${p.phone_b}`}
+                    className="flex items-center justify-between py-2.5 gap-3"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <span className="text-[10px] font-mono text-zinc-600 w-5">{i + 1}.</span>
+                      <div className="min-w-0">
+                        <div className="font-mono text-xs text-zinc-100 truncate">
+                          +{p.phone_a}
+                          {p.label_a ? <span className="text-zinc-500"> · {p.label_a}</span> : null}
+                          <span className="text-zinc-700 mx-2">↔</span>
+                          +{p.phone_b}
+                          {p.label_b ? <span className="text-zinc-500"> · {p.label_b}</span> : null}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="font-mono text-sm text-emerald-400">
+                        {p.overlap_minutes} min
+                      </div>
+                      <div className="text-[10px] font-mono text-zinc-500">
+                        {p.overlap_pct}% du plus court
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="mt-3 text-[10px] font-mono text-zinc-600 leading-relaxed">
+              ⓘ Calcul sur les 14 derniers jours. Un chevauchement élevé peut suggérer
+              que deux numéros se parlent ou suivent le même rythme de vie.
+            </p>
+          </Panel>
+        )}
 
         {/* Alert Rules */}
         <Panel
@@ -1665,6 +2110,9 @@ export default function App() {
               <option value="">all events</option>
               <option value="online">online</option>
               <option value="offline">offline</option>
+              <option value="composing">composing</option>
+              <option value="recording">recording</option>
+              <option value="profile_change">profile_change</option>
               <option value="alert">alert</option>
               <option value="client_state">client_state</option>
             </select>
@@ -1746,7 +2194,23 @@ export default function App() {
                               <Dot color="bg-red-500" /> ALERT
                             </span>
                           )}
-                          {!isOnline && !isOffline && !isState && !isAlert && (
+                          {ev.event_type === "composing" && (
+                            <span className="inline-flex items-center gap-1.5 text-cyan-400">
+                              <Dot color="bg-cyan-400" /> TYPING
+                            </span>
+                          )}
+                          {ev.event_type === "recording" && (
+                            <span className="inline-flex items-center gap-1.5 text-fuchsia-400">
+                              <Dot color="bg-fuchsia-400" /> AUDIO
+                            </span>
+                          )}
+                          {ev.event_type === "profile_change" && (
+                            <span className="inline-flex items-center gap-1.5 text-violet-400">
+                              <Dot color="bg-violet-400" /> PROFILE
+                            </span>
+                          )}
+                          {!isOnline && !isOffline && !isState && !isAlert &&
+                           !["composing", "recording", "profile_change"].includes(ev.event_type) && (
                             <span className="text-zinc-500">{ev.event_type}</span>
                           )}
                         </td>
