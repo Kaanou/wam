@@ -684,6 +684,7 @@ export default function App() {
   const liveFlashRef = useRef(new Set());
   const filterPhoneRef = useRef("");
   const filterEventRef = useRef("");
+  const fetchAllRef = useRef(null);
 
   // browser notification permission
   const [notifPerm, setNotifPerm] = useState(
@@ -725,9 +726,10 @@ export default function App() {
     fetchAll();
   }, [fetchAll]);
 
-  // Sync filter refs — avoid stale closure in WS handler
+  // Sync refs — avoid stale closure in WS handler
   useEffect(() => { filterPhoneRef.current = filterPhone; }, [filterPhone]);
   useEffect(() => { filterEventRef.current = filterEvent; }, [filterEvent]);
+  useEffect(() => { fetchAllRef.current = fetchAll; }, [fetchAll]);
 
   // Periodic refresh of QR + status (Node service may take time to boot)
   useEffect(() => {
@@ -839,6 +841,8 @@ export default function App() {
         setQrDataUrl(null);
         setPairingCode(null);
         toast.success("WhatsApp connecté");
+        // Auto-refresh monitors + full state after connection
+        if (fetchAllRef.current) fetchAllRef.current();
       } else if (data.state === "qr") {
         // refetch qr
         axios.get(`${API}/whatsapp/qr`).then((r) => {
@@ -847,6 +851,7 @@ export default function App() {
         });
       } else if (data.state === "disconnected") {
         toast.error("WhatsApp déconnecté");
+        if (fetchAllRef.current) fetchAllRef.current();
       }
     } else if (data.type === "activity") {
       // composing | recording — short-lived signal, just toast + log
@@ -1335,6 +1340,15 @@ export default function App() {
       toast.error("Erreur lors de la déconnexion");
     }
   };
+
+  const reloadEvents = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API}/events?limit=200`);
+      setEvents(res.data || []);
+    } catch (err) {
+      console.error("reloadEvents:", err);
+    }
+  }, []);
 
   const clearLogs = async () => {
     if (!window.confirm("Effacer tous les logs ? Action irréversible.")) return;
