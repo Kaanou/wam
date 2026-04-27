@@ -1341,14 +1341,6 @@ export default function App() {
     }
   };
 
-  const reloadEvents = useCallback(async () => {
-    try {
-      const res = await axios.get(`${API}/events?limit=200`);
-      setEvents(res.data || []);
-    } catch (err) {
-      console.error("reloadEvents:", err);
-    }
-  }, []);
 
   const clearLogs = async () => {
     if (!window.confirm("Effacer tous les logs ? Action irréversible.")) return;
