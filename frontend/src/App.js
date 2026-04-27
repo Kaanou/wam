@@ -32,7 +32,7 @@ import {
 } from "lucide-react";
 import "@/App.css";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8001";
 const API = `${BACKEND_URL}/api`;
 
 // ---------- helpers ----------
@@ -681,6 +681,8 @@ export default function App() {
 
   const wsRef = useRef(null);
   const liveFlashRef = useRef(new Set());
+  const filterPhoneRef = useRef("");
+  const filterEventRef = useRef("");
 
   // browser notification permission
   const [notifPerm, setNotifPerm] = useState(
@@ -719,6 +721,10 @@ export default function App() {
     fetchAll();
   }, [fetchAll]);
 
+  // Sync filter refs — avoid stale closure in WS handler
+  useEffect(() => { filterPhoneRef.current = filterPhone; }, [filterPhone]);
+  useEffect(() => { filterEventRef.current = filterEvent; }, [filterEvent]);
+
   // Periodic refresh of QR + status (Node service may take time to boot)
   useEffect(() => {
     const id = setInterval(async () => {
@@ -754,8 +760,11 @@ export default function App() {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // keepalive
         ws.send("hi");
+        const ping = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+        }, 25000);
+        ws.addEventListener("close", () => clearInterval(ping));
       };
 
       ws.onmessage = (msg) => {
@@ -790,8 +799,8 @@ export default function App() {
       const { phone, status, timestamp, id } = data;
       // Only prepend to local events list if it matches current filter view
       const matchesFilter =
-        (!filterPhone.trim() || phone.includes(filterPhone.replace(/[^0-9]/g, ""))) &&
-        (!filterEvent || filterEvent === status);
+        (!filterPhoneRef.current.trim() || phone.includes(filterPhoneRef.current.replace(/[^0-9]/g, ""))) &&
+        (!filterEventRef.current || filterEventRef.current === status);
       if (matchesFilter) {
         setEvents((prev) =>
           [{ id, phone, event_type: status, timestamp, detail: null }, ...prev].slice(0, 500),
@@ -839,8 +848,8 @@ export default function App() {
       // composing | recording — short-lived signal, just toast + log
       const { phone, activity, timestamp, id } = data;
       const matches =
-        (!filterPhone.trim() || phone.includes(filterPhone.replace(/[^0-9]/g, ""))) &&
-        (!filterEvent || filterEvent === activity);
+        (!filterPhoneRef.current.trim() || phone.includes(filterPhoneRef.current.replace(/[^0-9]/g, ""))) &&
+        (!filterEventRef.current || filterEventRef.current === activity);
       if (matches) {
         setEvents((prev) =>
           [{ id, phone, event_type: activity, timestamp, detail: null }, ...prev].slice(0, 500),
@@ -860,8 +869,8 @@ export default function App() {
       const { phone, changes, timestamp, id } = data;
       const fields = Object.keys(changes || {}).join(", ");
       const matches =
-        (!filterPhone.trim() || phone.includes(filterPhone.replace(/[^0-9]/g, ""))) &&
-        (!filterEvent || filterEvent === "profile_change");
+        (!filterPhoneRef.current.trim() || phone.includes(filterPhoneRef.current.replace(/[^0-9]/g, ""))) &&
+        (!filterEventRef.current || filterEventRef.current === "profile_change");
       if (matches) {
         setEvents((prev) =>
           [
@@ -1324,10 +1333,14 @@ export default function App() {
   };
 
   const clearLogs = async () => {
-    if (!window.confirm("Effacer tous les logs ?")) return;
-    await axios.delete(`${API}/events`);
-    setEvents([]);
-    toast("Logs effacés");
+    if (!window.confirm("Effacer tous les logs ? Action irréversible.")) return;
+    try {
+      await axios.delete(`${API}/events`);
+      setEvents([]);
+      toast("Logs effacés");
+    } catch {
+      toast.error("Erreur lors de la suppression des logs");
+    }
   };
 
   // ---------- render ----------
