@@ -1,58 +1,57 @@
 /**
- * WhatsApp presence monitoring service.
- * Uses whatsapp-web.js (unofficial). Exposes a small HTTP API consumed
- * only by the FastAPI backend on localhost. Pushes presence events to
- * the backend via HTTP webhook.
+ * WhatsApp presence monitoring service — Baileys edition.
+ * Replaces whatsapp-web.js (Puppeteer/Chrome) with @whiskeysockets/baileys
+ * which connects directly to WhatsApp's protocol — no browser needed.
+ *
+ * Exposes the same HTTP API as the previous server so the FastAPI backend
+ * requires zero changes.
  */
+
 const express = require("express");
 const QRCode = require("qrcode");
 const axios = require("axios");
-const { Client, LocalAuth } = require("whatsapp-web.js");
 const path = require("path");
+const fs = require("fs");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers,
+} = require("@whiskeysockets/baileys");
+const { Boom } = require("@hapi/boom");
+const P = require("pino");
 
 const PORT = parseInt(process.env.WA_SERVICE_PORT || "3001", 10);
 const BACKEND_WEBHOOK =
   process.env.BACKEND_WEBHOOK_URL || "http://localhost:8001/api/internal/event";
 const POLL_INTERVAL_MS = parseInt(process.env.PRESENCE_POLL_MS || "12000", 10);
 const INTERNAL_SECRET = process.env.INTERNAL_API_SECRET || "";
+const AUTH_DIR = path.join(__dirname, ".baileys_auth");
 
 const app = express();
 app.use(express.json());
 
-// Pairing-by-code state
-let pendingPairingPhone = null; // user-provided phone awaiting code
-let lastPairingCode = null; // last code returned by whatsapp-web.js
+// ---- Logger (quiet in prod) --------------------------------------------------
+const logger = P({ level: "silent" });
+
+// ---- State ------------------------------------------------------------------
+let sock = null;
+let clientState = "initializing";
+let lastQrDataUrl = null;
+let lastQrRaw = null;
+let meInfo = null;
 let pairingMode = "qr"; // "qr" | "code"
+let pendingPairingPhone = null;
+let lastPairingCode = null;
+let pairingCodeError = null;
+let reconnectTimer = null;
 
-// ---- WhatsApp client state ---------------------------------------------------
-let clientState = "initializing"; // initializing | qr | authenticated | ready | disconnected | auth_failure
-let lastQr = null; // raw QR string
-let lastQrDataUrl = null; // base64 PNG data URL
-let meInfo = null; // info about the paired account
-
-// monitored numbers: { phone: { jid, status: "online"|"offline"|"unknown", lastSeen: ISO|null } }
+// monitored numbers: Map<phone, { jid, status, lastSeen }>
 const monitored = new Map();
 
-const client = new Client({
-  authStrategy: new LocalAuth({
-    clientId: "main",
-    dataPath: path.join(__dirname, ".wwebjs_auth"),
-  }),
-  puppeteer: {
-    headless: true,
-    executablePath: process.env.CHROMIUM_PATH || "/usr/bin/google-chrome",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-first-run",
-      "--no-zygote",
-      "--single-process",
-    ],
-  },
-});
-
+// ---- Webhook ----------------------------------------------------------------
 async function postEvent(payload) {
   try {
     const headers = INTERNAL_SECRET
@@ -60,503 +59,283 @@ async function postEvent(payload) {
       : {};
     await axios.post(BACKEND_WEBHOOK, payload, { timeout: 5000, headers });
   } catch (err) {
-    console.error("[wa] webhook post failed:", err.message);
+    console.error("[wa] webhook failed:", err.message);
   }
 }
 
-client.on("qr", async (qr) => {
-  clientState = "qr";
-  lastQr = qr;
-  try {
-    lastQrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 360 });
-  } catch (e) {
-    lastQrDataUrl = null;
-  }
-  console.log("[wa] QR received");
-  postEvent({ type: "client_state", state: "qr" });
-  // NOTE: do NOT auto-request a pairing code here. WhatsApp rate-limits
-  // (and outright blocks) repeated code requests. The user explicitly
-  // triggers a fresh code via POST /pairing-code.
-});
-
-client.on("authenticated", () => {
-  console.log("[wa] authenticated");
-  clientState = "authenticated";
-  postEvent({ type: "client_state", state: "authenticated" });
-});
-
-client.on("auth_failure", (msg) => {
-  console.error("[wa] auth_failure:", msg);
-  clientState = "auth_failure";
-  postEvent({ type: "client_state", state: "auth_failure", message: msg });
-});
-
-client.on("ready", async () => {
-  console.log("[wa] ready");
-  clientState = "ready";
-  lastQr = null;
-  lastQrDataUrl = null;
-  try {
-    meInfo = client.info ? { wid: client.info.wid?._serialized, pushname: client.info.pushname } : null;
-  } catch {
-    meInfo = null;
-  }
-  postEvent({ type: "client_state", state: "ready", me: meInfo });
-});
-
-client.on("disconnected", (reason) => {
-  console.warn("[wa] disconnected:", reason);
-  clientState = "disconnected";
-  postEvent({ type: "client_state", state: "disconnected", reason });
-});
-
-// Listen to presence updates pushed by the WhatsApp server.
-client.on("presence_update", async (presence) => {
-  try {
-    const id = presence?.id?._serialized || presence?.id;
-    if (!id) return;
-    const phone = jidToPhone(id);
-    if (!monitored.has(phone)) return;
-
-    // chatstates is an array { state: "available"|"unavailable"|"composing"|"recording"|... }
-    let isOnline = null;
-    let composingState = null; // "composing" | "recording" | null
-    if (Array.isArray(presence.chatstates)) {
-      const me =
-        presence.chatstates.find((c) => c.id?._serialized === id) ||
-        presence.chatstates[0];
-      if (me) {
-        const s = me.type || me.state;
-        if (s === "available") isOnline = true;
-        else if (s === "unavailable") isOnline = false;
-        else if (s === "composing" || s === "recording") {
-          isOnline = true; // typing/recording implies online
-          composingState = s;
-        }
-      }
-    }
-    if (isOnline === null && presence.isOnline !== undefined) isOnline = !!presence.isOnline;
-
-    const entry = monitored.get(phone);
-    const nowIso = new Date().toISOString();
-
-    // Capture last_seen if WhatsApp publishes it.
-    if (presence.lastSeen) {
-      const lsIso = new Date(presence.lastSeen * 1000).toISOString();
-      if (entry.lastSeenPublic !== lsIso) {
-        entry.lastSeenPublic = lsIso;
-        postEvent({
-          type: "last_seen_update",
-          phone,
-          last_seen_public: lsIso,
-          timestamp: nowIso,
-        });
-      }
-    }
-
-    if (composingState && entry.composing !== composingState) {
-      entry.composing = composingState;
-      postEvent({
-        type: "activity",
-        phone,
-        activity: composingState, // "composing" | "recording"
-        timestamp: nowIso,
-      });
-      // Reset composing state after 8 s of no further updates so the next
-      // composing event re-fires.
-      clearTimeout(entry.composingTimer);
-      entry.composingTimer = setTimeout(() => {
-        entry.composing = null;
-      }, 8000);
-    }
-
-    if (isOnline === null) return;
-    const newStatus = isOnline ? "online" : "offline";
-    if (entry.status !== newStatus) {
-      entry.status = newStatus;
-      entry.lastSeen = nowIso;
-      monitored.set(phone, entry);
-      postEvent({
-        type: "presence",
-        phone,
-        status: newStatus,
-        timestamp: entry.lastSeen,
-      });
-    }
-  } catch (err) {
-    console.error("[wa] presence_update error:", err.message);
-  }
-});
-
-function phoneToJid(rawPhone) {
-  const digits = String(rawPhone).replace(/[^0-9]/g, "");
-  return `${digits}@c.us`;
-}
-function jidToPhone(jid) {
-  return String(jid).split("@")[0];
-}
-
-// ---- Polling fallback --------------------------------------------------------
-async function pollPresenceLoop() {
-  while (true) {
-    if (clientState === "ready" && monitored.size > 0) {
-      for (const [phone, entry] of monitored.entries()) {
-        try {
-          const chat = await client.getChatById(entry.jid);
-          if (!chat) continue;
-          // Fetch current presence — returns { isOnline, lastSeen, ... } when
-          // the contact's privacy allows it. We use this DIRECTLY rather than
-          // waiting for the (unreliable) presence_update event.
-          let presence = null;
-          if (typeof chat.fetchPresence === "function") {
-            presence = await chat.fetchPresence().catch((e) => {
-              console.warn(`[wa] fetchPresence ${phone}:`, e?.message);
-              return null;
-            });
-          }
-          if (!presence) continue;
-
-          const nowIso = new Date().toISOString();
-
-          // Capture lastSeen if WhatsApp publishes it.
-          if (typeof presence.lastSeen === "number" && presence.lastSeen > 0) {
-            const lsIso = new Date(presence.lastSeen * 1000).toISOString();
-            if (entry.lastSeenPublic !== lsIso) {
-              entry.lastSeenPublic = lsIso;
-              postEvent({
-                type: "last_seen_update",
-                phone,
-                last_seen_public: lsIso,
-                timestamp: nowIso,
-              });
-            }
-          }
-
-          // Direct online/offline from presence object
-          if (typeof presence.isOnline === "boolean") {
-            const newStatus = presence.isOnline ? "online" : "offline";
-            if (entry.status !== newStatus) {
-              entry.status = newStatus;
-              entry.lastSeen = nowIso;
-              monitored.set(phone, entry);
-              postEvent({
-                type: "presence",
-                phone,
-                status: newStatus,
-                timestamp: nowIso,
-              });
-            }
-          }
-        } catch (err) {
-          console.warn(`[wa] poll ${phone}:`, err?.message);
-        }
-      }
-    }
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-  }
-}
-
-// Diagnostic endpoint: returns the raw fetchPresence result for a phone.
-// Helps users diagnose why a monitor is stuck on UNKNOWN.
-app.get("/debug-presence/:phone", async (req, res) => {
-  const phone = String(req.params.phone).replace(/[^0-9]/g, "");
-  if (clientState !== "ready") {
-    return res.status(409).json({ error: "whatsapp not ready", state: clientState });
-  }
-  try {
-    const numberId = await client.getNumberId(phone);
-    if (!numberId) return res.status(404).json({ error: "number not on whatsapp" });
-    const jid = numberId._serialized;
-    const chat = await client.getChatById(jid);
-    if (!chat) return res.status(404).json({ error: "chat not found" });
-
-    let presence = null;
-    let presenceError = null;
+// ---- Presence polling -------------------------------------------------------
+async function pollPresence() {
+  if (!sock || clientState !== "ready") return;
+  for (const [phone, info] of monitored.entries()) {
     try {
-      presence = await chat.fetchPresence();
+      await sock.sendPresenceUpdate("available");
+      await sock.presenceSubscribe(info.jid);
     } catch (e) {
-      presenceError = String(e?.message || e);
+      // ignore
     }
-    const me = client.info?.wid?._serialized;
-    const isSelf = me === jid;
-    return res.json({
-      phone,
-      jid,
-      is_self: isSelf,
-      paired_as: me,
-      presence,
-      presence_error: presenceError,
-      hint: isSelf
-        ? "Vous surveillez votre propre numéro — WhatsApp ne pousse pas la présence vers la même session. Ajoutez un AUTRE numéro."
-        : presence == null
-        ? "fetchPresence a retourné null — généralement privacy 'Vu à' du contact restreinte à 'Personne' ou 'Mes contacts' (et vous n'êtes pas dans ses contacts)."
-        : presence.isOnline === undefined
-        ? "WhatsApp a renvoyé un objet sans champ isOnline — privacy partielle probable."
-        : "OK, présence reçue.",
-    });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// ---- Profile polling --------------------------------------------------------
-// Every PROFILE_POLL_MS, fetch profile pic, name and about for each monitored
-// number. Compare with the last known snapshot and emit profile_change events.
-const PROFILE_POLL_MS = parseInt(process.env.PROFILE_POLL_MS || "1800000", 10); // 30 min default
-const profileSnapshots = new Map(); // phone -> { pic_url, name, about }
-
-async function pollProfilesLoop() {
-  // Initial delay so we don't poll immediately at boot.
-  await new Promise((r) => setTimeout(r, 60_000));
-  while (true) {
-    if (clientState === "ready" && monitored.size > 0) {
-      for (const [phone, entry] of monitored.entries()) {
-        try {
-          const contact = await client.getContactById(entry.jid);
-          if (!contact) continue;
-          let picUrl = null;
-          try {
-            picUrl = await contact.getProfilePicUrl();
-          } catch {
-            picUrl = null;
-          }
-          let about = null;
-          try {
-            about = await contact.getAbout();
-          } catch {
-            about = null;
-          }
-          const name = contact.pushname || contact.name || null;
-
-          const prev = profileSnapshots.get(phone) || {};
-          const changes = {};
-          if (prev.pic_url !== picUrl) changes.pic_url = { from: prev.pic_url || null, to: picUrl };
-          if (prev.name !== name) changes.name = { from: prev.name || null, to: name };
-          if (prev.about !== about) changes.about = { from: prev.about || null, to: about };
-
-          const next = { pic_url: picUrl, name, about };
-          profileSnapshots.set(phone, next);
-
-          // First snapshot — initial baseline, don't emit events.
-          if (!prev.captured_at) {
-            postEvent({
-              type: "profile_snapshot",
-              phone,
-              pic_url: picUrl,
-              name,
-              about,
-              first: true,
-              timestamp: new Date().toISOString(),
-            });
-            next.captured_at = new Date().toISOString();
-            continue;
-          }
-          if (Object.keys(changes).length > 0) {
-            postEvent({
-              type: "profile_change",
-              phone,
-              changes,
-              pic_url: picUrl,
-              name,
-              about,
-              timestamp: new Date().toISOString(),
-            });
-          }
-        } catch (err) {
-          console.error(`[wa] profile poll ${phone} error:`, err.message);
-        }
-      }
-    }
-    await new Promise((r) => setTimeout(r, PROFILE_POLL_MS));
   }
 }
 
-// ---- HTTP API ----------------------------------------------------------------
-app.get("/health", (req, res) => {
-  res.json({ ok: true, state: clientState });
-});
+let pollTimer = null;
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollPresence, POLL_INTERVAL_MS);
+}
+
+// ---- Baileys connection -----------------------------------------------------
+async function connectToWhatsApp() {
+  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version } = await fetchLatestBaileysVersion();
+
+  sock = makeWASocket({
+    version,
+    logger,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    browser: Browsers.ubuntu("Chrome"),
+    printQRInTerminal: false,
+    generateHighQualityLinkPreview: false,
+    syncFullHistory: false,
+  });
+
+  // ---- QR / pairing code --------------------------------------------------
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      clientState = "qr";
+      lastQrRaw = qr;
+      try {
+        lastQrDataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 360 });
+      } catch (e) {
+        lastQrDataUrl = null;
+      }
+      console.log("[wa] QR received");
+      postEvent({ type: "client_state", state: "qr" });
+
+      // Auto-request pairing code if mode is "code" and phone is set
+      if (pairingMode === "code" && pendingPairingPhone && !sock.authState.creds.registered) {
+        try {
+          const code = await sock.requestPairingCode(pendingPairingPhone);
+          lastPairingCode = code?.match(/.{1,4}/g)?.join("-") || code;
+          pairingCodeError = null;
+          console.log("[wa] Pairing code:", lastPairingCode);
+          postEvent({ type: "pairing_code", code: lastPairingCode });
+        } catch (e) {
+          pairingCodeError = e.message;
+          console.error("[wa] Pairing code error:", e.message);
+        }
+      }
+    }
+
+    if (connection === "open") {
+      clientState = "ready";
+      lastQrDataUrl = null;
+      lastQrRaw = null;
+      lastPairingCode = null;
+      meInfo = {
+        pushname: sock.user?.name || "",
+        phone: sock.user?.id?.split(":")[0] || "",
+      };
+      console.log("[wa] Connected as", meInfo.pushname);
+      postEvent({ type: "client_state", state: "ready" });
+      startPolling();
+
+      // Re-subscribe presence for all monitored numbers
+      for (const [, info] of monitored.entries()) {
+        try {
+          await sock.presenceSubscribe(info.jid);
+        } catch (e) { /* ignore */ }
+      }
+    }
+
+    if (connection === "close") {
+      startPolling(); // stop
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const shouldReconnect = reason !== DisconnectReason.loggedOut;
+      console.log("[wa] Disconnected. Reason:", reason, "Reconnect:", shouldReconnect);
+
+      if (reason === DisconnectReason.loggedOut) {
+        clientState = "disconnected";
+        meInfo = null;
+        postEvent({ type: "client_state", state: "disconnected" });
+        // Clear auth
+        try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+      } else if (shouldReconnect) {
+        clientState = "initializing";
+        postEvent({ type: "client_state", state: "initializing" });
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => connectToWhatsApp(), 3000);
+      } else {
+        clientState = "auth_failure";
+        postEvent({ type: "client_state", state: "auth_failure" });
+      }
+    }
+  });
+
+  // ---- Presence updates ---------------------------------------------------
+  sock.ev.on("presence.update", ({ id, presences }) => {
+    for (const [phone, info] of monitored.entries()) {
+      if (info.jid === id || id.startsWith(phone)) {
+        const p = presences[id] || presences[Object.keys(presences)[0]];
+        if (!p) continue;
+        const isOnline = p.lastKnownPresence === "available" || p.lastKnownPresence === "composing";
+        const newStatus = isOnline ? "online" : "offline";
+        const ts = new Date().toISOString();
+
+        if (info.status !== newStatus) {
+          info.status = newStatus;
+          info.lastSeen = ts;
+          monitored.set(phone, info);
+          console.log(`[wa] ${phone} → ${newStatus}`);
+          postEvent({
+            type: "presence",
+            phone,
+            status: newStatus,
+            timestamp: ts,
+            id: `${phone}_${Date.now()}`,
+          });
+        }
+
+        // last_seen from lastSeen timestamp
+        if (p.lastSeen) {
+          const lastSeenIso = new Date(p.lastSeen * 1000).toISOString();
+          postEvent({ type: "last_seen_update", phone, last_seen_public: lastSeenIso });
+        }
+      }
+    }
+  });
+
+  // ---- Credentials save ---------------------------------------------------
+  sock.ev.on("creds.update", saveCreds);
+}
+
+// ---- HTTP API (same contract as whatsapp-web.js version) --------------------
 
 app.get("/status", (req, res) => {
-  res.json({
-    state: clientState,
-    me: meInfo,
-    monitored_count: monitored.size,
-  });
+  res.json({ state: clientState, me: meInfo });
 });
 
 app.get("/qr", (req, res) => {
-  if (clientState === "ready") {
-    return res.json({ state: clientState, qr: null, code: null });
-  }
   res.json({
-    state: clientState,
-    qr: pairingMode === "qr" ? lastQrDataUrl : null,
-    code: pairingMode === "code" ? lastPairingCode : null,
-    code_error: pairingMode === "code" ? lastPairingCodeError : null,
+    qr: lastQrDataUrl,
+    code: lastPairingCode,
+    code_error: pairingCodeError,
     mode: pairingMode,
   });
 });
 
-// Request pairing-by-code (8-digit) for a given phone number.
-// Per-call only — no auto-retry on QR refresh (WhatsApp rate-limits it).
+app.post("/pairing-mode", (req, res) => {
+  const mode = req.query.mode || req.body?.mode;
+  if (mode === "qr" || mode === "code") {
+    pairingMode = mode;
+    if (mode === "qr") { lastPairingCode = null; pairingCodeError = null; }
+  }
+  res.json({ mode: pairingMode });
+});
+
 app.post("/pairing-code", async (req, res) => {
-  const phone = String(req.body?.phone || "").replace(/[^0-9]/g, "");
-  if (!phone || phone.length < 7) {
-    return res.status(400).json({ error: "invalid phone" });
+  const { phone } = req.body || {};
+  if (!phone) return res.status(400).json({ error: "phone required" });
+  if (clientState !== "qr") {
+    return res.status(400).json({ error: "Not in QR state. Wait for QR first." });
   }
-  if (clientState === "ready") {
-    return res.status(409).json({ error: "already paired" });
-  }
-  // Local rate-limit: prevent the user from spamming the button.
-  const now = Date.now();
-  if (now - lastPairingCodeAt < 30_000) {
-    return res.status(429).json({
-      error: "Trop de tentatives. Patientez 30 secondes avant de redemander un code.",
-    });
+  if (sock?.authState?.creds?.registered) {
+    return res.status(400).json({ error: "Already registered" });
   }
   pendingPairingPhone = phone;
   pairingMode = "code";
-  lastPairingCode = null;
-  lastPairingCodeError = null;
-
-  if (clientState !== "qr") {
-    return res.json({ ok: true, code: null, pending: true });
-  }
-  // Rate-limit attempts (success or failure) to avoid hammering WhatsApp.
-  lastPairingCodeAt = Date.now();
   try {
-    const code = await client.requestPairingCode(phone);
-    lastPairingCode = code || null;
-    console.log("[wa] pairing code:", code);
-    return res.json({ ok: true, code });
-  } catch (err) {
-    const msg =
-      String(err?.message || "").length > 1
-        ? String(err.message)
-        : "WhatsApp a refusé la demande (rate-limit probable). Essayez le QR depuis un autre appareil ou réinitialisez la session.";
-    lastPairingCodeError = msg;
-    console.error("[wa] pairing code (immediate) failed:", err.message);
-    return res.status(502).json({ error: msg });
-  }
-});
-
-// Cancel code pairing — go back to QR mode.
-app.post("/pairing-mode", (req, res) => {
-  const mode = req.body?.mode === "code" ? "code" : "qr";
-  pairingMode = mode;
-  if (mode === "qr") {
-    pendingPairingPhone = null;
-    lastPairingCode = null;
-  }
-  res.json({ ok: true, mode: pairingMode });
-});
-
-app.get("/monitors", (req, res) => {
-  const items = [];
-  for (const [phone, entry] of monitored.entries()) {
-    items.push({ phone, status: entry.status, last_seen: entry.lastSeen });
-  }
-  res.json({ items });
-});
-
-app.post("/monitors", async (req, res) => {
-  const phone = String(req.body?.phone || "").replace(/[^0-9]/g, "");
-  if (!phone) return res.status(400).json({ error: "phone required" });
-  if (clientState !== "ready") {
-    return res.status(409).json({ error: "whatsapp not ready", state: clientState });
-  }
-  try {
-    const numberId = await client.getNumberId(phone);
-    if (!numberId) {
-      return res.status(404).json({ error: "number not on whatsapp" });
-    }
-    const jid = numberId._serialized;
-    if (!monitored.has(phone)) {
-      monitored.set(phone, { jid, status: "unknown", lastSeen: null });
-    }
-    // Trigger initial presence subscription
-    try {
-      const chat = await client.getChatById(jid);
-      if (chat && typeof chat.fetchPresence === "function") {
-        await chat.fetchPresence().catch(() => {});
-      }
-    } catch {}
-    res.json({ ok: true, phone, jid });
-  } catch (err) {
-    console.error("[wa] add monitor failed:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete("/monitors/:phone", (req, res) => {
-  const phone = String(req.params.phone).replace(/[^0-9]/g, "");
-  monitored.delete(phone);
-  res.json({ ok: true });
-});
-
-app.post("/logout", async (req, res) => {
-  try {
-    await client.logout();
+    const code = await sock.requestPairingCode(phone);
+    lastPairingCode = code?.match(/.{1,4}/g)?.join("-") || code;
+    pairingCodeError = null;
+    res.json({ code: lastPairingCode });
   } catch (e) {
-    console.error("[wa] logout error:", e.message);
-  }
-  monitored.clear();
-  clientState = "initializing";
-  pairingMode = "qr";
-  pendingPairingPhone = null;
-  lastPairingCode = null;
-  lastPairingCodeError = null;
-  res.json({ ok: true });
-  // Re-init after logout
-  setTimeout(() => {
-    client.initialize().catch((e) => console.error("[wa] re-init failed:", e.message));
-  }, 1000);
-});
-
-// Hard reset — destroys the LocalAuth session on disk and re-inits a fresh client.
-// Useful when WhatsApp has rate-limited us into a stuck state.
-app.post("/reset", async (req, res) => {
-  try {
-    try {
-      await client.destroy();
-    } catch (e) {
-      /* ignore */
-    }
-    monitored.clear();
-    clientState = "initializing";
-    pairingMode = "qr";
-    pendingPairingPhone = null;
-    lastPairingCode = null;
-    lastPairingCodeError = null;
-    lastQr = null;
-    lastQrDataUrl = null;
-    lastPairingCodeAt = 0;
-    // Wipe the auth folder.
-    const fs = require("fs");
-    const authDir = path.join(__dirname, ".wwebjs_auth");
-    try {
-      fs.rmSync(authDir, { recursive: true, force: true });
-    } catch (e) {
-      console.error("[wa] reset rm error:", e.message);
-    }
-    res.json({ ok: true });
-    setTimeout(() => {
-      client.initialize().catch((e) => console.error("[wa] reset re-init failed:", e.message));
-    }, 800);
-  } catch (e) {
-    console.error("[wa] reset error:", e.message);
+    pairingCodeError = e.message;
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---- Boot --------------------------------------------------------------------
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[wa] http listening on :${PORT}`);
+app.post("/monitors", (req, res) => {
+  const { phone } = req.body || {};
+  if (!phone) return res.status(400).json({ error: "phone required" });
+  const jid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
+  monitored.set(phone, { jid, status: "unknown", lastSeen: null });
+  // Subscribe presence immediately
+  if (sock && clientState === "ready") {
+    sock.presenceSubscribe(jid).catch(() => {});
+  }
+  res.json({ ok: true });
 });
 
-console.log("[wa] initializing whatsapp client...");
-client.initialize().catch((err) => {
-  console.error("[wa] initialize failed:", err);
+app.delete("/monitors/:phone", (req, res) => {
+  monitored.delete(req.params.phone);
+  res.json({ ok: true });
 });
-pollPresenceLoop().catch((err) => console.error("[wa] poll loop error:", err));
-pollProfilesLoop().catch((err) => console.error("[wa] profile poll loop error:", err));
+
+app.get("/monitors", (req, res) => {
+  const list = [];
+  for (const [phone, info] of monitored.entries()) {
+    list.push({ phone, status: info.status, lastSeen: info.lastSeen });
+  }
+  res.json(list);
+});
+
+app.post("/logout", async (req, res) => {
+  try {
+    if (sock) await sock.logout();
+  } catch (e) { /* ignore */ }
+  try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+  monitored.clear();
+  clientState = "initializing";
+  meInfo = null;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => connectToWhatsApp(), 1000);
+  res.json({ ok: true });
+});
+
+app.post("/reset-session", async (req, res) => {
+  try { if (sock) await sock.logout(); } catch (e) {}
+  try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+  monitored.clear();
+  clientState = "initializing";
+  meInfo = null;
+  lastQrDataUrl = null;
+  lastPairingCode = null;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => connectToWhatsApp(), 500);
+  res.json({ ok: true });
+});
+
+app.get("/profile/:phone", async (req, res) => {
+  const phone = req.params.phone;
+  const jid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
+  try {
+    const [pic, info] = await Promise.allSettled([
+      sock?.profilePictureUrl(jid, "image"),
+      sock?.fetchStatus(jid),
+    ]);
+    res.json({
+      phone,
+      picture_url: pic.status === "fulfilled" ? pic.value : null,
+      about: info.status === "fulfilled" ? info.value?.status : null,
+    });
+  } catch (e) {
+    res.json({ phone, picture_url: null, about: null });
+  }
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, state: clientState });
+});
+
+// ---- Start ------------------------------------------------------------------
+app.listen(PORT, () => {
+  console.log(`[wa] Baileys service listening on port ${PORT}`);
+  connectToWhatsApp();
+});
