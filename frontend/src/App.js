@@ -677,6 +677,7 @@ export default function App() {
 
   // Backup
   const [restoring, setRestoring] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const fileInputRef = useRef(null);
 
   const wsRef = useRef(null);
@@ -690,6 +691,7 @@ export default function App() {
   );
 
   const fetchAll = useCallback(async () => {
+    setRefreshing(true);
     try {
       const [s, q, m, e, st, ar] = await Promise.all([
         axios.get(`${API}/whatsapp/status`),
@@ -714,6 +716,8 @@ export default function App() {
       setSummaryHour(typeof st.data?.daily_summary_hour === "number" ? st.data.daily_summary_hour : 9);
     } catch (err) {
       console.error("fetchAll error:", err);
+    } finally {
+      setRefreshing(false);
     }
   }, []);
 
@@ -1399,10 +1403,11 @@ export default function App() {
             <button
               data-testid="refresh-button"
               onClick={fetchAll}
-              className="p-2 border border-zinc-800 rounded-sm hover:bg-zinc-900 text-zinc-400 hover:text-zinc-100 transition-colors"
-              title="Refresh"
+              disabled={refreshing}
+              className="p-2 border border-zinc-800 rounded-sm hover:bg-zinc-900 text-zinc-400 hover:text-zinc-100 disabled:opacity-50 transition-colors"
+              title="Rafraîchir"
             >
-              <RefreshCw size={14} strokeWidth={1.75} />
+              <RefreshCw size={14} strokeWidth={1.75} className={refreshing ? "animate-spin" : ""} />
             </button>
             {waState.state === "ready" && (
               <button
@@ -2080,6 +2085,15 @@ export default function App() {
           testid="panel-logs"
           right={
             <div className="flex items-center gap-2">
+              <button
+                data-testid="refresh-logs-button"
+                onClick={reloadEvents}
+                title="Rafraîchir les logs"
+                className="p-1 text-zinc-500 hover:text-emerald-400 transition-colors"
+              >
+                <RefreshCw size={11} strokeWidth={1.75} />
+              </button>
+              <span className="text-zinc-800">·</span>
               <button
                 data-testid="export-csv-button"
                 onClick={exportCsv}
